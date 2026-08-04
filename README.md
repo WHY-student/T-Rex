@@ -123,7 +123,8 @@ T-Rex/
 ├── tactile_vqvae/                  tactile VQ-VAE model (used by the embedded tokenizer)
 ├── scripts/                        post-train + ZMQ inference server
 │   ├── train.sh      + train.py       post-train SFT (fine-tune from a midtrain ckpt)
-│   └── test.sh       + test.py        ZMQ inference server
+│   ├── test.sh       + test.py        ZMQ inference server
+│   └── lora_test.py + lora_test.sh    strict Action-LoRA inference launcher
 ├── utils/                          data prep + checkpoint tooling
 │   ├── gen_json_tac_deltabase_eef_bimanual_parallel.py + gen_json_bimanual.sh
 │   │                                  raw task data → training JSON (eef-62)
@@ -169,6 +170,7 @@ Edit the path variables at the top of each `.sh`, then run it.
 |---|---|---|---|
 | **Post-train** | `scripts/train.sh` | `DATA_JSON` (or `LEROBOT_ROOT`), `ORIGIN_MODEL_PATH`, `DEFORM_ENCODER_PATH`, `RESUME_CHECKPOINT` | Task-specific fine-tune on a small JSON or LeRobot dataset, resuming from the released midtrain checkpoint. Tactile codes are encoded on the fly; the embedded VQ-VAE is auto-detected from the checkpoint (no `VQVAE_CKPT` needed). `RESUME_SOURCE=midtrain` keeps the tactile expert as-is. |
 | **Inference** | `scripts/test.sh` | `MODEL_PATH` | ZMQ REP server speaking the slow/fast cascaded protocol. Auto-detects architecture + embedded VQ-VAE from the checkpoint's `training_args.json`. |
+| **LoRA inference** | `scripts/lora_test.py` | `--checkpoint_path`, `--lerobot_root` | Same server with strict loading and a hard requirement that Action-LoRA tensors are present and reconstructed. |
 
 Each `.sh` is a plain script: paths are direct variable assignments at the top,
 the conda env + exports are in the header, and the launch command follows. Only
@@ -187,6 +189,20 @@ ZMQ REP socket with three request modes:
 The ablation `--disable_tactile 1` swaps the slow tick for
 `forward_flow_action_full` (full τ ∈ [0, 1] on the action expert alone)
 and is the cleanest "without tactile expert" baseline.
+
+For the 65-D Origami Action-LoRA checkpoint:
+
+```bash
+T-Rex/scripts/lora_test.sh
+```
+
+`lora_test.py` defaults to the historical Origami preprocessing size
+`384×288`, infers LoRA rank from `lora_A`, uses persisted alpha when present
+(otherwise the historical `alpha=2×rank`), and refuses non-strict loading.
+`lora_test.sh` defaults to this workspace's checkpoint-0-60000, LeRobot
+dataset and `trex` conda interpreter. Override with
+`TREX_LORA_CHECKPOINT`, `TREX_LEROBOT_ROOT`, `TREX_CUDA_INDEX` or
+`TREX_SERVER_PORT`.
 
 The robot-side client that drives this server on the real Vega-1 (REQ socket,
 slow every chunk start, tactile-only fast ticks in between) is
@@ -332,11 +348,17 @@ checkpoint-{epoch}-{step}/
 ```
 
 At inference, `test.py` reads `training_args.json` and auto-restores
-`tactile_intermediate_size`, `n_flare_tokens_per_frame`, `n_flare_steps`,
-`use_tactile_code`, `vqvae_codebook_size`, `use_tactile_vqvae`, `vqvae_config`,
-`cascaded_total_steps`, and `cascaded_split_step` — so flags don't need to be
-repeated on the CLI, and an embedded VQ-VAE is rebuilt automatically. `train.py`
-likewise auto-detects an embedded VQ-VAE from the resume checkpoint.
+the action/state dimensions, action chunk, tactile/flare/VQ-VAE modules,
+cascaded schedule, image size, and action-expert LoRA layout before loading
+weights. Loading is strict by default so a partially random action expert
+cannot be hidden by `strict=False`. Native LeRobot `meta/stats.json` and legacy
+T-Rex statistics JSON are both accepted via `--stats_path`. `train.py` likewise
+auto-detects an embedded VQ-VAE from the resume checkpoint.
+
+Older LoRA checkpoints did not store alpha. Rank is inferred from `lora_A`;
+when alpha is absent, inference uses the historical post-training default
+`alpha = 2 * rank` and prints a warning. New checkpoints persist
+`action_lora_{rank,alpha,dropout}`, `lerobot_root`, and `image_size`.
 
 `Qwen3VLVLAModel` loads checkpoints with `strict=False` and a
 shape-mismatch filter, so checkpoints produced by earlier builds with

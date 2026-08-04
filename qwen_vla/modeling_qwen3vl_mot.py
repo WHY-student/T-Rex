@@ -635,7 +635,7 @@ class Qwen3VLModelMoT(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training and past_key_values is None:
                 layer_out = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,

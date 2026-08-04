@@ -83,6 +83,21 @@ inference:
   # Language instruction (or pass --task-description on the command line).
   task_description: ""
   dual_arm: true
+  # delta_eef62: original EEF-delta + IK path.
+  # absolute_joint65: exact Origami joint targets, no EEF conversion/IK.
+  control_mode: delta_eef62
+  # In absolute_joint65 mode, fill these with the seven real SDK joints in
+  # dataset motor_j0..motor_j6 order, e.g. "lower_body:lower_body_joint_1".
+  # The client refuses to start while this mapping or the reset pose is empty.
+  absolute_joint65_body_joint_map: []
+  # Leave both empty to use limits reported by the SDK.
+  absolute_joint65_body_lower_limits: []
+  absolute_joint65_body_upper_limits: []
+  absolute_joint65_body_default_joint_pos: []
+  absolute_joint65_max_step_rad: 0.05
+  # Existing online Pinocchio collision checks cover only arm/hand 58D.
+  # Enable only after reviewing body collisions on the real North robot.
+  absolute_joint65_acknowledge_body_collision_unchecked: false
   chunk_size: 16
   execute_steps_per_chunk: 16
   max_steps: 10000

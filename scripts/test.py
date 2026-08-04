@@ -37,6 +37,11 @@ from PIL import Image
 import zmq
 from transformers import AutoProcessor
 from qwen_vla import Qwen3VLVLAModel, extend_position_ids_for_flare, split_slow_fast_embeds
+from qwen_vla.checkpoint_restore import (
+    load_checkpoint_state,
+    load_inference_statistics,
+    restore_action_lora,
+)
 
 
 def _normalize(values, mask, vmin, vmax):
@@ -158,23 +163,58 @@ def model_load(args):
     if os.path.exists(ta_path):
         with open(ta_path) as f:
             ta = json.load(f)
-        for key, default in [("tactile_intermediate_size", 0),
-                             ("n_flare_tokens_per_frame", 0),
-                             ("n_flare_steps", 0),
-                             ("use_tactile_code", 0),
-                             ("vqvae_codebook_size", 64),
-                             ("use_tactile_vqvae", 0),
-                             ("cascaded_total_steps", 10),
-                             ("cascaded_split_step", 6)]:
-            saved = ta.get(key, default)
-            cli_val = getattr(args, key, default)
-            if saved and cli_val == default:
-                setattr(args, key, saved)
-                print(f"Auto-detected {key}={saved} from training_args.json")
+        # These values change module shapes or inference semantics.  Parser
+        # defaults are None so a checkpoint restores itself unless the caller
+        # explicitly overrides a value.
+        for key, default in [
+            ("action_dim", 31),
+            ("action_chunk", 8),
+            ("use_robot_state", 0),
+            ("use_tactile_deform", 1),
+            ("use_tactile_vec", 0),
+            ("tactile_intermediate_size", 0),
+            ("n_flare_tokens_per_frame", 0),
+            ("n_flare_steps", 0),
+            ("use_tactile_code", 0),
+            ("vqvae_codebook_size", 64),
+            ("use_tactile_vqvae", 0),
+            ("cascaded_total_steps", 10),
+            ("cascaded_split_step", 6),
+            ("image_size", None),
+        ]:
+            if getattr(args, key, None) is None:
+                restored = ta.get(key, default)
+                setattr(args, key, restored)
+                if key in ta:
+                    print(f"Auto-detected {key}={restored} from training_args.json")
         # vqvae_config is a dict — restore it verbatim so the embedded VQ-VAE
         # submodule is rebuilt with the right architecture before weights load.
         if ta.get("vqvae_config") is not None and getattr(args, "vqvae_config", None) is None:
             args.vqvae_config = ta["vqvae_config"]
+    else:
+        for key, default in [
+            ("action_dim", 31),
+            ("action_chunk", 8),
+            ("use_robot_state", 0),
+            ("use_tactile_deform", 1),
+            ("use_tactile_vec", 0),
+            ("tactile_intermediate_size", 0),
+            ("n_flare_tokens_per_frame", 0),
+            ("n_flare_steps", 0),
+            ("use_tactile_code", 0),
+            ("vqvae_codebook_size", 64),
+            ("use_tactile_vqvae", 0),
+            ("cascaded_total_steps", 10),
+            ("cascaded_split_step", 6),
+            ("image_size", None),
+        ]:
+            if getattr(args, key, None) is None:
+                setattr(args, key, default)
+
+    ckpt_file = os.path.join(ckpt, "model.pt")
+    if not os.path.isfile(ckpt_file):
+        raise FileNotFoundError(f"model.pt not found in checkpoint: {ckpt}")
+    sd = load_checkpoint_state(ckpt_file)
 
     tac_isize = args.tactile_intermediate_size if args.tactile_intermediate_size > 0 else None
     n_flare_tpf = getattr(args, "n_flare_tokens_per_frame", 0)
@@ -229,12 +269,40 @@ def model_load(args):
             vqvae_config=getattr(args, "vqvae_config", None),
         )
 
-    ckpt_file = os.path.join(ckpt, "model.pt")
-    sd = torch.load(ckpt_file, map_location="cpu")
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f"Checkpoint loaded: missing={len(missing)}, unexpected={len(unexpected)}")
-    if missing:
-        print(f"  missing (first 10): {missing[:10]}")
+    lora = restore_action_lora(
+        model,
+        sd,
+        training_args=ta,
+        rank=getattr(args, "action_lora_rank", None),
+        alpha=getattr(args, "action_lora_alpha", None),
+    )
+    if lora is None and getattr(args, "require_action_lora", False):
+        raise RuntimeError(
+            "This launch path requires an Action LoRA checkpoint, but model.pt "
+            "contains no *.lora_A tensors."
+        )
+    if lora is not None:
+        count, rank, alpha = lora
+        if "action_lora_alpha" not in ta and getattr(args, "action_lora_alpha", None) is None:
+            print(
+                "WARNING: checkpoint predates persisted LoRA metadata; "
+                f"using historical alpha=2*rank={alpha:g}."
+            )
+        print(
+            f"Reconstructed action-expert LoRA: modules={count}, "
+            f"rank={rank}, alpha={alpha:g}, dropout=0 (inference)"
+        )
+
+    if getattr(args, "allow_non_strict_checkpoint", False):
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"Checkpoint loaded non-strictly: missing={len(missing)}, unexpected={len(unexpected)}")
+        if missing:
+            print(f"  missing (first 10): {missing[:10]}")
+        if unexpected:
+            print(f"  unexpected (first 10): {unexpected[:10]}")
+    else:
+        model.load_state_dict(sd, strict=True)
+        print("Checkpoint loaded strictly: missing=0, unexpected=0")
     model = model.to(torch.bfloat16)
 
     # Keep the embedded VQ-VAE + its F6 stats in fp32 so on-the-fly codes match
@@ -254,29 +322,29 @@ def model_load(args):
         candidate = os.path.join(ckpt, "stats_data.json")
         if os.path.exists(candidate):
             stats_path = candidate
+    if not stats_path and ta.get("stats_path"):
+        stats_path = ta["stats_path"]
+    if not stats_path and ta.get("lerobot_root"):
+        candidate = os.path.join(ta["lerobot_root"], "meta", "stats.json")
+        if os.path.exists(candidate):
+            stats_path = candidate
+    if not stats_path and getattr(args, "lerobot_root", ""):
+        candidate = os.path.join(args.lerobot_root, "meta", "stats.json")
+        if os.path.exists(candidate):
+            stats_path = candidate
     if not stats_path or not os.path.exists(stats_path):
-        raise FileNotFoundError("Cannot find stats JSON.")
+        raise FileNotFoundError(
+            "Cannot find normalization statistics. Pass --stats_path to either "
+            "LeRobot meta/stats.json or the legacy T-Rex statistics JSON."
+        )
 
-    with open(stats_path) as f:
-        stats_raw = json.load(f)
-    ds = args.dataset_name if args.dataset_name and args.dataset_name in stats_raw \
-         else next(iter(stats_raw))
-
-    def _arr(key, sub):
-        return np.array(stats_raw[ds][key][sub])
-
-    statistic = {
-        "action_mask": _arr("action", "mask"),
-        "action_min":  _arr("action", "q01"),
-        "action_max":  _arr("action", "q99"),
-        "tacf6_mask":  _arr("tactile_f6", "mask"),
-        "tacf6_min":   _arr("tactile_f6", "q01"),
-        "tacf6_max":   _arr("tactile_f6", "q99"),
-    }
-    if args.use_robot_state:
-        statistic["state_mask"] = _arr("state", "mask")
-        statistic["state_min"]  = _arr("state", "q01")
-        statistic["state_max"]  = _arr("state", "q99")
+    statistic = load_inference_statistics(
+        stats_path,
+        action_dim=args.action_dim,
+        use_robot_state=bool(args.use_robot_state),
+        dataset_name=args.dataset_name,
+    )
+    print(f"Statistics loaded from: {stats_path}")
 
     return model, processor, statistic
 
@@ -390,6 +458,11 @@ class CascadedServer:
             print(f">>> embedded VQ-VAE in model — F6 encoded on-the-fly "
                   f"(K={model.tactile_vqvae.cfg.codebook_size}, W={self.vqvae_window})")
         elif bool(getattr(args, "use_tactile_code", 0)):
+            if not args.vqvae_ckpt:
+                raise ValueError(
+                    "--vqvae_ckpt is required for legacy external tactile-code "
+                    "inference; this checkpoint has no embedded tactile_vqvae."
+                )
             from tactile_vqvae.models.tactile_vqvae import (
                 TactileVQVAE, TactileVQVAEConfig)
             from tactile_vqvae.data.stats import TacF6Stats
@@ -720,8 +793,18 @@ def main(args):
     n_fast_cams = 2 if args.action_dim > 31 else 1
     dummy_fast  = [Image.new("RGB", (224, 224), color="black") for _ in range(n_fast_cams)]
     dummy_state = np.zeros(args.action_dim, dtype=np.float32) if args.use_robot_state else None
-    dummy_f6    = np.zeros((5, 6), dtype=np.float32) if args.use_tactile_vec else None
-    dummy_deform = np.zeros((5, 240, 240), dtype=np.float32) if args.use_tactile_deform else None
+    n_fingers = 10 if args.action_dim > 31 else 5
+    needs_f6 = bool(
+        args.use_tactile_vec
+        or args.use_tactile_code
+        or getattr(args, "use_tactile_vqvae", 0)
+    )
+    dummy_f6 = np.zeros((n_fingers, 6), dtype=np.float32) if needs_f6 else None
+    dummy_deform = (
+        np.zeros((n_fingers, 240, 240), dtype=np.float32)
+        if args.use_tactile_deform
+        else None
+    )
 
     server = CascadedServer(args, model, processor, statistic)
     # Warm-up: run one slow_and_fast and discard
@@ -781,32 +864,52 @@ def _pil_to_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Real-world ZMQ server (with flare prediction)")
+def build_arg_parser(
+    description: str = "Real-world ZMQ server (with flare prediction)",
+):
+    """Build the shared CLI used by test.py and the LoRA-only launcher."""
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--base_model_path", type=str, default="")
     parser.add_argument("--stats_path", type=str, default="")
+    parser.add_argument(
+        "--lerobot_root",
+        type=str,
+        default="",
+        help="LeRobot dataset root; uses <root>/meta/stats.json when --stats_path is omitted.",
+    )
     parser.add_argument("--dataset_name", type=str, default="")
-    parser.add_argument("--action_dim", type=int, default=31)
-    parser.add_argument("--action_chunk", type=int, default=8)
-    parser.add_argument("--use_robot_state", type=int, default=0)
-    parser.add_argument("--use_tactile_deform", type=int, default=1)
-    parser.add_argument("--use_tactile_vec", type=int, default=0)
-    parser.add_argument("--tactile_intermediate_size", type=int, default=0)
-    parser.add_argument("--n_flare_tokens_per_frame", type=int, default=0,
-                        help="0 = auto-detect from training_args.json")
-    parser.add_argument("--n_flare_steps", type=int, default=0,
-                        help="0 = auto-detect from training_args.json")
+    parser.add_argument("--action_dim", type=int, default=None)
+    parser.add_argument("--action_chunk", type=int, default=None)
+    parser.add_argument("--use_robot_state", type=int, default=None)
+    parser.add_argument("--use_tactile_deform", type=int, default=None)
+    parser.add_argument("--use_tactile_vec", type=int, default=None)
+    parser.add_argument("--tactile_intermediate_size", type=int, default=None)
+    parser.add_argument("--n_flare_tokens_per_frame", type=int, default=None,
+                        help="default: restore from training_args.json")
+    parser.add_argument("--n_flare_steps", type=int, default=None,
+                        help="default: restore from training_args.json")
     parser.add_argument("--cuda", type=str, default="0")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--image_size", type=int, nargs=2, default=None, metavar=("W", "H"))
+    parser.add_argument("--action_lora_rank", type=int, default=None,
+                        help="default: infer from checkpoint lora_A tensors")
+    parser.add_argument("--action_lora_alpha", type=float, default=None,
+                        help="default: training metadata, or historical 2*rank")
+    parser.add_argument("--allow_non_strict_checkpoint", action="store_true",
+                        help="diagnostic escape hatch; strict loading is the default")
+    parser.add_argument(
+        "--require_action_lora",
+        action="store_true",
+        help="fail unless model.pt contains and reconstructs Action LoRA tensors",
+    )
 
     # Cascaded flow matching schedule (auto-detected from training_args.json
     # when available).  The client sends payloads with mode='slow' once per
     # action chunk and mode='fast' multiple times within the chunk window;
     # the first request must be 'slow' or 'slow_and_fast'.
-    parser.add_argument("--cascaded_total_steps", type=int, default=10)
-    parser.add_argument("--cascaded_split_step",  type=int, default=6)
+    parser.add_argument("--cascaded_total_steps", type=int, default=None)
+    parser.add_argument("--cascaded_split_step",  type=int, default=None)
 
     # Ablation: action-expert-only inference (no tactile expert ever invoked).
     # The action expert integrates the full τ ∈ [0, 1] flow for
@@ -822,17 +925,19 @@ if __name__ == "__main__":
     # flag to revert.  When 1, --vqvae_ckpt must be a TactileVQVAE latest.pt.
     # Server maintains a rolling 16-frame F6 buffer and encodes per-hand on
     # each fast tick.
-    parser.add_argument("--use_tactile_code", type=int, default=0,
+    parser.add_argument("--use_tactile_code", type=int, default=None,
                         help="1: server-side VQ-VAE encodes a rolling F6 "
                              "window into 2 codes per fast tick.")
-    parser.add_argument("--vqvae_codebook_size", type=int, default=64,
+    parser.add_argument("--vqvae_codebook_size", type=int, default=None,
                         help="Codebook size of the VQ-VAE that produces the codes.")
     parser.add_argument("--vqvae_ckpt", type=str, default="",
                         help="Path to TactileVQVAE checkpoint (latest.pt). "
-                             "Required when --use_tactile_code 1.")
+                             "Required only for legacy checkpoints without an "
+                             "embedded tactile_vqvae.")
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
     args = parser.parse_args()
-    if bool(args.use_tactile_code) and not args.vqvae_ckpt:
-        parser.error("--vqvae_ckpt must be set when --use_tactile_code 1")
     main(args)
-

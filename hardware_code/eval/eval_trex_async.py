@@ -3,12 +3,10 @@
 Connects to the slow/fast cascaded inference server (T-Rex/scripts/test.py)
 over ZMQ REQ and executes the returned action chunks on the robot.
 
-Control mode (the only one supported): the policy outputs, per action step,
-a delta end-effector pose relative to the chunk-start EEF pose (3 local xyz +
-6 rot6d per arm) plus absolute hand joint targets (22 per hand); deltas are
-resolved to joint targets via differential IK (PinkLocalIK). Other control
-modes (absolute EEF, delta/absolute joint space) are straightforward
-variations on the chunk-execution loop if your policy head differs.
+Supported control modes:
+  * delta_eef62: delta end-effector pose plus absolute hands, resolved by IK.
+  * absolute_joint65: exact Origami joint order
+    [L arm7 | L hand22 | R arm7 | R hand22 | motor7], with no EEF/IK path.
 
 All site/deployment settings come from the YAML config (see
 config/default.yaml, including the `inference:` section); run with
@@ -44,6 +42,11 @@ from PIL import Image
 from sharpa import ControlMode, ControlSource, HandSide, SharpaWave, SharpaWaveManager
 
 from camera.head_camera_receiver import HeadCameraReceiver
+from eval.absolute_joint65 import (
+    AbsoluteJoint65Adapter,
+    BodyJointBinding,
+    Joint65CommandRejected,
+)
 
 # Wrist camera imports
 from camera.wrist_camera_receiver import WristCameraReceiver
@@ -580,11 +583,55 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
     logger.info(f"Task: {task_description}")
     default_joint_pos = cfg.robot.default_joint_pos
     dual_arm = inf.dual_arm
+    control_mode = inf.control_mode.strip().lower()
+    if control_mode not in {"delta_eef62", "absolute_joint65"}:
+        raise ValueError(
+            f"Unsupported inference.control_mode={inf.control_mode!r}; expected "
+            "'delta_eef62' or 'absolute_joint65'"
+        )
+    if not 0 < inf.execute_steps_per_chunk <= inf.chunk_size:
+        raise ValueError(
+            "inference.execute_steps_per_chunk must be in [1, chunk_size], got "
+            f"{inf.execute_steps_per_chunk} for chunk_size={inf.chunk_size}"
+        )
+    if control_mode == "absolute_joint65":
+        if not dual_arm:
+            raise ValueError("absolute_joint65 requires inference.dual_arm=true")
+        if not inf.absolute_joint65_acknowledge_body_collision_unchecked:
+            raise ValueError(
+                "absolute_joint65 body commands are disabled because the existing "
+                "online Pinocchio collision model covers only the first 58 arm/hand "
+                "joints. After reviewing body collisions on the real North setup, "
+                "set absolute_joint65_acknowledge_body_collision_unchecked=true."
+            )
+        if len(inf.absolute_joint65_body_default_joint_pos) != 7:
+            raise ValueError(
+                "absolute_joint65_body_default_joint_pos must contain seven "
+                "motor_j0..motor_j6 reset values"
+            )
+        if inf.head_crop_box is not None:
+            logger.warning(
+                "absolute_joint65 checkpoint training used full head frames in the "
+                "known Origami run; verify head_crop_box matches this checkpoint."
+            )
+    logger.info(f"Control mode: {control_mode}")
 
     # Initialize robot with head camera
     logger.info("Initializing robot...")
     dexmate_bimanual_robot = Robot()
     logger.info(f"Robot '{dexmate_bimanual_robot.robot_model}' initialized")
+    body_joint_binding = None
+    if control_mode == "absolute_joint65":
+        body_joint_binding = BodyJointBinding(
+            dexmate_bimanual_robot,
+            inf.absolute_joint65_body_joint_map,
+            lower_limits=inf.absolute_joint65_body_lower_limits,
+            upper_limits=inf.absolute_joint65_body_upper_limits,
+        )
+        logger.info(
+            "Validated motor_j0..motor_j6 SDK bindings: "
+            f"{list(body_joint_binding.entries)}"
+        )
 
     # Initialize head camera via ZMQ receiver
     logger.info("Initializing head camera...")
@@ -608,9 +655,12 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
     wrist_cam_receiver.start_receiving(timeout=10.0)
     logger.info("Wrist cameras started receiving")
 
-    # Initialize IK solver
-    pink_ik_solver = PinkLocalIK(default_joint_by_component=default_joint_pos)
-    logger.info("IK solver initialized")
+    # The 65-D path is pure joint space and deliberately never constructs an
+    # EEF/FK/IK solver.
+    pink_ik_solver = None
+    if control_mode == "delta_eef62":
+        pink_ik_solver = PinkLocalIK(default_joint_by_component=default_joint_pos)
+        logger.info("IK solver initialized")
 
     # Initialize ArmIKManager and SmoothingAndSafetyManager for processing arm targets and sending commands
     # Initialize SmoothingAndSafetyManager for processing arm targets and sending commands
@@ -640,6 +690,48 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
     )
     logger.info("SmoothingAndSafetyManager initialized")
 
+    arm_hand_lower_limits = None
+    arm_hand_upper_limits = None
+    if control_mode == "absolute_joint65":
+        component_map = dexmate_bimanual_robot.get_controllable_component_map()
+        sdk_arm_limits = {}
+        for arm_name in ("left_arm", "right_arm"):
+            component = component_map[arm_name]
+            limits = component.joint_pos_limit
+            if limits is None:
+                raise ValueError(
+                    f"Robot SDK does not expose physical limits for {arm_name}"
+                )
+            names = list(component.joint_name)
+            sdk_arm_limits[arm_name] = np.asarray(
+                [
+                    limits[names.index(joint_name)]
+                    for joint_name in DEXMATE_COMPONENT_NAME_TO_JOINT_NAMES[arm_name]
+                ],
+                dtype=np.float64,
+            )
+        # Arm limits come from the connected hardware SDK. Sharpa does not
+        # expose per-joint limits through this API, so hands use the exact
+        # limits already enforced by the existing high-rate controller.
+        lower = disassemble_qpos(pin_full_robot_wrapper.model.lowerPositionLimit)
+        upper = disassemble_qpos(pin_full_robot_wrapper.model.upperPositionLimit)
+        arm_hand_lower_limits = np.concatenate(
+            [
+                sdk_arm_limits["left_arm"][:, 0],
+                lower["left_hand"],
+                sdk_arm_limits["right_arm"][:, 0],
+                lower["right_hand"],
+            ]
+        )
+        arm_hand_upper_limits = np.concatenate(
+            [
+                sdk_arm_limits["left_arm"][:, 1],
+                upper["left_hand"],
+                sdk_arm_limits["right_arm"][:, 1],
+                upper["right_hand"],
+            ]
+        )
+
     # Initialize hands
     logger.info("Connecting to hands...")
     left_hand, right_hand = connect_hands(cfg.hands.left_serial, cfg.hands.right_serial)
@@ -660,6 +752,25 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
     time.sleep(1)
     logger.info("Hands ready")
 
+    absolute_joint65_adapter = None
+    if control_mode == "absolute_joint65":
+        assert body_joint_binding is not None
+        absolute_joint65_adapter = AbsoluteJoint65Adapter(
+            dexmate_bimanual_robot,
+            left_hand,
+            right_hand,
+            body_joint_binding,
+            left_arm_joint_names=DEXMATE_COMPONENT_NAME_TO_JOINT_NAMES["left_arm"],
+            right_arm_joint_names=DEXMATE_COMPONENT_NAME_TO_JOINT_NAMES["right_arm"],
+            max_step_rad=inf.absolute_joint65_max_step_rad,
+            arm_hand_lower_limits=arm_hand_lower_limits,
+            arm_hand_upper_limits=arm_hand_upper_limits,
+        )
+        logger.info(
+            "absolute_joint65 adapter ready: exact 7/22/7/22/7 split, "
+            f"max_step={inf.absolute_joint65_max_step_rad:.4f} rad"
+        )
+
     # Initialize full robot action buffer and thread
     logger.info("Initializing full robot action thread...")
     action_buf_lock = threading.Lock()
@@ -670,6 +781,27 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
         "right_hand": None,
     }  # None means buffer is empty/stopped
     hardware_lock = threading.Lock()
+
+    def reset_absolute_joint65_body():
+        if absolute_joint65_adapter is None:
+            return
+        reset_target = np.asarray(
+            inf.absolute_joint65_body_default_joint_pos, dtype=np.float64
+        )
+        with hardware_lock:
+            body_targets = absolute_joint65_adapter.body_binding.component_targets(
+                reset_target
+            )
+            dexmate_bimanual_robot.set_joint_pos(
+                joint_pos=body_targets,
+                relative=False,
+                wait_time=2.0,
+            )
+        logger.info(
+            "Reset absolute_joint65 body motors to "
+            f"{reset_target.tolist()}"
+        )
+
     full_robot_action_terminate_event = threading.Event()
     full_robot_action_thread = threading.Thread(
         target=full_robot_action_loop,
@@ -723,6 +855,7 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
         dof_error_tolerance=cfg.control.reset_dof_err_tol,
         hold_time_s=0.5,
     )
+    reset_absolute_joint65_body()
     logger.info("Robot moved to initial position")
 
     # Initialize tactile buffers and thread (matches main_teleop.py pattern)
@@ -820,6 +953,7 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
                 dof_error_tolerance=cfg.control.reset_dof_err_tol,
                 hold_time_s=0.5,
             )
+            reset_absolute_joint65_body()
             time.sleep(1)
 
             # Wait for user to start
@@ -862,14 +996,20 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
                     continue
 
                 # 2. Get current state
-                proprio = get_current_pose(
-                    dexmate_bimanual_robot,
-                    pink_ik_solver,
-                    hardware_lock,
-                    left_hand,
-                    right_hand,
-                    dual_arm,
-                )
+                if control_mode == "absolute_joint65":
+                    assert absolute_joint65_adapter is not None
+                    with hardware_lock:
+                        proprio = absolute_joint65_adapter.read_state()
+                else:
+                    assert pink_ik_solver is not None
+                    proprio = get_current_pose(
+                        dexmate_bimanual_robot,
+                        pink_ik_solver,
+                        hardware_lock,
+                        left_hand,
+                        right_hand,
+                        dual_arm,
+                    )
 
                 images = get_all_camera_images(
                     dexmate_bimanual_robot,
@@ -942,18 +1082,32 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
                 if response_bytes is None:
                     break
                 response = pickle.loads(response_bytes)
-                assert response.get("status") == "success"
+                if response.get("status") != "success":
+                    raise RuntimeError(
+                        "VLA inference failed: "
+                        f"{response.get('message', response)}"
+                    )
                 action = np.array(response.get("actions"))
                 # print(f"Received raw action from VLA: {action.shape}")
                 # input("Press [Enter] to execute this action chunk...")
-                if dual_arm:
-                    assert action.shape in [(inf.chunk_size, 58), (inf.chunk_size, 62)], (
-                        f"Unexpected action shape: {action.shape}"
-                    )
+                if control_mode == "absolute_joint65":
+                    if action.shape != (inf.chunk_size, 65):
+                        raise Joint65CommandRejected(
+                            "absolute_joint65 requires an exact [chunk,65] server "
+                            f"response, got {action.shape}"
+                        )
+                elif dual_arm:
+                    if action.shape != (inf.chunk_size, 62):
+                        raise ValueError(
+                            "delta_eef62 dual-arm mode requires [chunk,62], got "
+                            f"{action.shape}"
+                        )
                 else:
-                    assert action.shape in [(inf.chunk_size, 29), (inf.chunk_size, 31)], (
-                        f"Unexpected action shape: {action.shape}"
-                    )
+                    if action.shape != (inf.chunk_size, 31):
+                        raise ValueError(
+                            "delta_eef62 single-arm mode requires [chunk,31], got "
+                            f"{action.shape}"
+                        )
                 print(f"Received action chunk of shape {action.shape} from VLA")
                 print(f"Step {step}")
 
@@ -965,10 +1119,14 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
                 if inf.use_temporal_aggregation:
                     chunk_buffer.append((chunk_start_step, action.copy()))
 
-                with hardware_lock:
-                    initial_arm_joint_pos_dict = dexmate_bimanual_robot.get_joint_pos_dict(
-                        component=["left_arm", "right_arm"]
-                    )
+                if control_mode == "delta_eef62":
+                    assert pink_ik_solver is not None
+                    with hardware_lock:
+                        initial_arm_joint_pos_dict = (
+                            dexmate_bimanual_robot.get_joint_pos_dict(
+                                component=["left_arm", "right_arm"]
+                            )
+                        )
                     initial_left_q = np.array(
                         [
                             initial_arm_joint_pos_dict[name]
@@ -981,40 +1139,25 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
                             for name in DEXMATE_COMPONENT_NAME_TO_JOINT_NAMES["right_arm"]
                         ]
                     )
-                    initial_right_hand_q = np.array(
-                        right_hand.get_states().angles, dtype=np.float64
+
+                    fk_res_initial = pink_ik_solver.fk(
+                        frames=["L_ee", "R_ee"],
+                        joint_pos_by_component={
+                            "left_arm": initial_left_q,
+                            "right_arm": initial_right_q,
+                        },
                     )
+                    initial_left_ee_pose = fk_res_initial["L_ee"]
+                    initial_right_ee_pose = fk_res_initial["R_ee"]
+                    ik_warmstart_right_q = initial_right_q.copy()
                     if dual_arm:
-                        initial_left_hand_q = np.array(
-                            left_hand.get_states().angles, dtype=np.float64
-                        )
+                        ik_warmstart_left_q = initial_left_q.copy()
 
-                fk_res_initial = pink_ik_solver.fk(
-                    frames=["L_ee", "R_ee"],
-                    joint_pos_by_component={
-                        "left_arm": initial_left_q,
-                        "right_arm": initial_right_q,
-                    },
-                )
-                initial_left_ee_pose = fk_res_initial["L_ee"]
-                initial_right_ee_pose = fk_res_initial["R_ee"]
-
-                ik_warmstart_right_q = initial_right_q.copy()
-                if dual_arm:
-                    ik_warmstart_left_q = initial_left_q.copy()
-
-                # ── Chunk execution: delta-EEF control mode (the only supported one) ──
-                # Each action step holds, per arm, a delta EEF pose relative to the
-                # EEF pose at chunk start (3 local xyz + 6 rot6d) plus 22 absolute
-                # hand joints: (chunk_size, 62) dual-arm, (chunk_size, 31) single-arm.
-                # Deltas resolve to joint targets via differential IK below. Other
-                # control modes (absolute EEF / joint space) are straightforward
-                # variations of this loop.
-                initial_pos = initial_right_ee_pose.translation
-                initial_R = initial_right_ee_pose.rotation
-                if dual_arm:
-                    initial_left_pos = initial_left_ee_pose.translation
-                    initial_left_R = initial_left_ee_pose.rotation
+                    initial_pos = initial_right_ee_pose.translation
+                    initial_R = initial_right_ee_pose.rotation
+                    if dual_arm:
+                        initial_left_pos = initial_left_ee_pose.translation
+                        initial_left_R = initial_left_ee_pose.rotation
 
                 for action_idx in range(inf.execute_steps_per_chunk):
                     if key_ctrl.quit_requested or key_ctrl.reset_requested:
@@ -1109,7 +1252,35 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
                     else:
                         current_action = action[action_idx]
 
-                    if dual_arm:
+                    if control_mode == "absolute_joint65":
+                        assert absolute_joint65_adapter is not None
+                        try:
+                            with hardware_lock:
+                                current_joint65 = absolute_joint65_adapter.read_state()
+                                joint65_parts, body_targets = (
+                                    absolute_joint65_adapter.prepare(
+                                        current_action, current_joint65
+                                    )
+                                )
+                                dexmate_bimanual_robot.set_joint_pos(
+                                    joint_pos=body_targets,
+                                    relative=False,
+                                    wait_time=0,
+                                )
+                            arm_hand_targets = (
+                                absolute_joint65_adapter.arm_hand_targets(joint65_parts)
+                            )
+                            with action_buf_lock:
+                                action_buffer.update(arm_hand_targets)
+                        except Joint65CommandRejected:
+                            with action_buf_lock:
+                                action_buffer["left_arm"] = None
+                                action_buffer["right_arm"] = None
+                                action_buffer["left_hand"] = None
+                                action_buffer["right_hand"] = None
+                            raise
+
+                    elif dual_arm:
                         delta_pos_local_left = current_action[0:3]
                         delta_rot6d_local_left = current_action[3:9]
                         target_hand_left = current_action[9:31]

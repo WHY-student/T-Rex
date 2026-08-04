@@ -138,6 +138,27 @@ class InferenceConfig:
     task_description: str = ""
     # False = right arm + right hand only (31-D actions instead of 62-D).
     dual_arm: bool = True
+    # "delta_eef62" keeps the original IK client. "absolute_joint65" consumes
+    # the Origami schema exactly as [L arm7 | L hand22 | R arm7 | R hand22 |
+    # motor7], with no EEF conversion or IK.
+    control_mode: str = "delta_eef62"
+    # Explicit dataset motor_j0..motor_j6 -> SDK component joint binding.
+    # Each entry is "component:joint_name".  Empty is intentionally invalid in
+    # absolute_joint65 mode: the seven body joints must never be guessed.
+    absolute_joint65_body_joint_map: list[str] = field(default_factory=list)
+    # Optional physical limits in motor_j0..motor_j6 order.  Leave both empty
+    # to require limits from the robot SDK.
+    absolute_joint65_body_lower_limits: list[float] = field(default_factory=list)
+    absolute_joint65_body_upper_limits: list[float] = field(default_factory=list)
+    # Required reset target for the seven body motors in absolute_joint65 mode.
+    absolute_joint65_body_default_joint_pos: list[float] = field(default_factory=list)
+    # Fail closed when any predicted joint changes by more than this in one
+    # 30 Hz command step. Commands are rejected, never clipped silently.
+    absolute_joint65_max_step_rad: float = 0.05
+    # The existing Pinocchio online collision model contains only the first
+    # 58 arm/hand joints and locks the body. Set this true only after a
+    # separate body-collision review for the real North setup.
+    absolute_joint65_acknowledge_body_collision_unchecked: bool = False
     # Action chunk length predicted by the policy.
     chunk_size: int = 16
     # Steps executed from each chunk before requesting a new one.
