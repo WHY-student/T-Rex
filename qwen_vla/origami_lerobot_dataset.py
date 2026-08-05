@@ -22,6 +22,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+from bisect import bisect_right
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -59,6 +61,124 @@ def _stat(native_stats: dict, key: str, dim: int, sub: str):
     raise KeyError(sub)
 
 
+def discover_lerobot_roots(root: str | os.PathLike) -> List[Path]:
+    """Resolve one dataset directory or a season collection.
+
+    The Origami release is commonly laid out as::
+
+        <dataset_root>/season_*/lerobot3.0/
+
+    A plain LeRobot directory is still accepted for backwards compatibility.
+    We deliberately only scan the immediate ``season_*/lerobot3.0`` children;
+    this prevents an adjacent ``lerobotv2.1`` export or an example directory
+    from being included accidentally.
+    """
+    path = Path(os.path.expanduser(str(root))).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"LeRobot root does not exist: {path}")
+
+    if (path / "meta" / "info.json").is_file():
+        roots = [path]
+    else:
+        candidates = sorted(path.glob("season_*/lerobot3.0"))
+        roots = [candidate for candidate in candidates if candidate.is_dir()]
+
+    if not roots:
+        raise FileNotFoundError(
+            f"No LeRobot v3.0 dataset found under {path}. Expected either "
+            f"{path}/meta/info.json or {path}/season_*/lerobot3.0/meta/info.json."
+        )
+
+    missing_meta = [str(candidate) for candidate in roots if not (candidate / "meta" / "info.json").is_file()]
+    if missing_meta:
+        raise FileNotFoundError(
+            "The following season directories are missing meta/info.json:\n"
+            + "\n".join(missing_meta)
+        )
+    return roots
+
+
+def _jsonable(value):
+    """Convert numpy-backed LeRobot statistics into JSON-compatible values."""
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer, np.bool_)):
+        return value.item()
+    return value
+
+
+class _ConcatLeRobotDataset(torch.utils.data.Dataset):
+    """A small local-path concat wrapper for LeRobotDataset instances.
+
+    ``MultiLeRobotDataset`` in upstream LeRobot expects all repositories below
+    one cache root. Here each season is already an independent local export,
+    so using a path-aware wrapper avoids copying or symlinking terabytes of
+    data and preserves each season's video paths and episode indices.
+    """
+
+    def __init__(self, datasets):
+        super().__init__()
+        self.datasets = list(datasets)
+        if not self.datasets:
+            raise ValueError("At least one LeRobot dataset is required")
+        self._lengths = [len(dataset) for dataset in self.datasets]
+        self._cumulative = np.cumsum(self._lengths).tolist()
+
+    def __len__(self):
+        return self._cumulative[-1]
+
+    @property
+    def num_episodes(self):
+        return sum(dataset.num_episodes for dataset in self.datasets)
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds for {len(self)} samples")
+        dataset_index = bisect_right(self._cumulative, idx)
+        previous_end = self._cumulative[dataset_index - 1] if dataset_index else 0
+        return self.datasets[dataset_index][idx - previous_end]
+
+
+class _EpisodeSubset(torch.utils.data.Dataset):
+    """Episode-filtered view over an already-open LeRobotDataset.
+
+    Reopening 46 season datasets with ``episodes=...`` makes LeRobot rescan
+    every selected parquet file and rebuild an absolute-index map. The full
+    datasets are already memory-mapped, so a lightweight index view is both
+    faster and substantially less memory hungry for validation splitting.
+    """
+
+    def __init__(self, dataset, episode_indices):
+        super().__init__()
+        self.dataset = dataset
+        frame_ranges = []
+        for episode_index in episode_indices:
+            episode = dataset.meta.episodes[int(episode_index)]
+            start = int(episode["dataset_from_index"])
+            end = int(episode["dataset_to_index"])
+            frame_ranges.append(np.arange(start, end, dtype=np.int64))
+        self.indices = np.concatenate(frame_ranges) if frame_ranges else np.empty(0, dtype=np.int64)
+        self._num_episodes = len(episode_indices)
+
+    def __len__(self):
+        return int(self.indices.size)
+
+    @property
+    def num_episodes(self):
+        return self._num_episodes
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds for {len(self)} samples")
+        return self.dataset[int(self.indices[idx])]
+
+
 class OrigamiLeRobotDataset(torch.utils.data.Dataset):
     """LeRobot loader for the 65D Origami dataset.
 
@@ -72,22 +192,49 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         self.processor = processor
         self.accelerator = accelerator
 
-        self.root = config.lerobot_root
-        repo_id = getattr(config, "lerobot_repo_id", "") or os.path.basename(self.root.rstrip("/"))
+        self.root = str(Path(os.path.expanduser(config.lerobot_root)).resolve())
+        self.dataset_roots = discover_lerobot_roots(self.root)
+        repo_prefix = getattr(config, "lerobot_repo_id", "") or "origami/local"
 
-        with open(os.path.join(self.root, "meta", "info.json")) as f:
-            info = json.load(f)
-        self.fps = int(info["fps"])
-        feats = info["features"]
+        infos = []
+        native_stats_list = []
+        for dataset_root in self.dataset_roots:
+            with open(dataset_root / "meta" / "info.json") as f:
+                info = json.load(f)
+            infos.append(info)
+
+            # Use LeRobot's loader so aggregate_stats receives numpy arrays,
+            # not the JSON lists stored on disk.
+            from lerobot.datasets.utils import load_stats
+
+            native_stats = load_stats(dataset_root)
+            if native_stats is None:
+                raise FileNotFoundError(f"Missing LeRobot statistics: {dataset_root / 'meta' / 'stats.json'}")
+            native_stats_list.append(native_stats)
+
+        self.fps = int(infos[0]["fps"])
+        if any(int(info["fps"]) != self.fps for info in infos[1:]):
+            raise ValueError(f"All Origami seasons must use the same fps; found {[info['fps'] for info in infos]}")
+
+        feats = infos[0]["features"]
+        for dataset_root, info in zip(self.dataset_roots, infos):
+            for key in (KEY_HEAD, KEY_WRIST_R, KEY_WRIST_L, KEY_STATE, KEY_ACTION, KEY_TACF6):
+                if key not in info["features"]:
+                    raise KeyError(f"{dataset_root} is missing required feature {key!r}")
+                if info["features"][key].get("shape") != feats[key].get("shape"):
+                    raise ValueError(
+                        f"Feature shape mismatch for {key!r}: {dataset_root} has "
+                        f"{info['features'][key].get('shape')}, expected {feats[key].get('shape')}"
+                    )
 
         required = [KEY_HEAD, KEY_WRIST_R, KEY_WRIST_L, KEY_STATE, KEY_ACTION, KEY_TACF6]
         missing = [k for k in required if k not in feats]
         if missing:
             raise KeyError(f"Origami dataset missing required feature(s): {missing}")
 
-        self.has_wrist = KEY_WRIST_R in feats and KEY_WRIST_L in feats
-        self.has_tactile = KEY_TACF6 in feats
-        self.has_deform = KEY_DEFORM in feats
+        self.has_wrist = all(KEY_WRIST_R in info["features"] and KEY_WRIST_L in info["features"] for info in infos)
+        self.has_tactile = all(KEY_TACF6 in info["features"] for info in infos)
+        self.has_deform = all(KEY_DEFORM in info["features"] for info in infos)
 
         self.image_size = tuple(config.image_size) if getattr(config, "image_size", None) else None
         self.use_flare = bool(getattr(config, "use_flare", 0))
@@ -105,8 +252,17 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         if self.action_dim != ACTION_DIM:
             raise ValueError(f"Origami loader expects action_dim={ACTION_DIM}, got {self.action_dim}")
 
-        with open(os.path.join(self.root, "meta", "stats.json")) as f:
-            native_stats = json.load(f)
+        if self.use_tactile_deform and not self.has_deform:
+            raise KeyError("--use_tactile_deform 1 requires observation.images.tactile_deform in every season")
+        if not self.has_wrist:
+            raise KeyError("Every season must contain both wrist camera streams")
+
+        from lerobot.datasets.compute_stats import aggregate_stats
+
+        native_stats = aggregate_stats(native_stats_list)
+        # This is written into each checkpoint so inference does not need a
+        # synthetic top-level meta/stats.json when training used many seasons.
+        self.stats_data = _jsonable(native_stats)
         self.action_mask = _stat(native_stats, KEY_ACTION, ACTION_DIM, "mask")
         self.action_min = _stat(native_stats, KEY_ACTION, ACTION_DIM, "q01")
         self.action_max = _stat(native_stats, KEY_ACTION, ACTION_DIM, "q99")
@@ -117,24 +273,53 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         self.tacf6_min = _stat(native_stats, KEY_TACF6, TACTILE_DIM, "q01")
         self.tacf6_max = _stat(native_stats, KEY_TACF6, TACTILE_DIM, "q99")
 
+        self._repo_ids = [
+            f"{repo_prefix}__{dataset_root.parent.name or index}"
+            for index, dataset_root in enumerate(self.dataset_roots)
+        ]
         if _ds is not None:
+            self._all_datasets = []
             self.ds = _ds
         else:
-            from lerobot.datasets.lerobot_dataset import LeRobotDataset
-            self.ds = LeRobotDataset(
-                repo_id,
-                root=self.root,
-                episodes=episodes,
-                delta_timestamps=self._build_delta_timestamps(),
-                tolerance_s=self.video_tolerance_s,
-                video_backend=self.video_backend,
-            )
+            self.ds = self._open_concat_dataset()
+            if episodes is not None:
+                if len(self.dataset_roots) != 1:
+                    raise ValueError("episodes=... is only supported for one LeRobot root")
+                self.ds = self._subset_concat_dataset([episodes])
 
         accelerator.print(
-            f"[Origami LeRobot] {repo_id}: {len(self.ds)} frames, fps={self.fps}, "
+            f"[Origami LeRobot] {len(self.dataset_roots)} season(s), {len(self.ds)} frames, "
+            f"fps={self.fps}, roots={self.dataset_roots[0]}"
+            + (f" ... {self.dataset_roots[-1]}" if len(self.dataset_roots) > 1 else "")
+            + ", "
             f"action_dim={self.action_dim}, action_chunk={self.action_chunk}, "
             f"tactile={self.has_tactile}, deform_mosaic={self.has_deform}"
         )
+
+    def _open_one_dataset(self, index: int):
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        return LeRobotDataset(
+            self._repo_ids[index],
+            root=self.dataset_roots[index],
+            delta_timestamps=self._build_delta_timestamps(),
+            tolerance_s=self.video_tolerance_s,
+            video_backend=self.video_backend,
+        )
+
+    def _open_concat_dataset(self):
+        self._all_datasets = [
+            self._open_one_dataset(index) for index in range(len(self.dataset_roots))
+        ]
+        return _ConcatLeRobotDataset(self._all_datasets)
+
+    def _subset_concat_dataset(self, episode_map):
+        datasets = [
+            _EpisodeSubset(dataset, selected_episodes)
+            for dataset, selected_episodes in zip(self._all_datasets, episode_map)
+            if selected_episodes
+        ]
+        return _ConcatLeRobotDataset(datasets)
 
     def _head_offsets(self):
         return [0.0] + [(k + 1) * self.flare_stride / self.fps for k in range(self.n_flare_steps)]
@@ -161,35 +346,54 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         return self.ds[idx]
 
     def create_val_split(self, val_ratio=0.05, seed=42):
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        if not 0 < val_ratio < 1:
+            raise ValueError(f"val_ratio must be in (0, 1), got {val_ratio}")
+        if not self._all_datasets:
+            raise RuntimeError("Validation splitting requires the built-in multi-season dataset loader")
 
-        n_ep = self.ds.meta.total_episodes
+        # Split by episode, not by frame, and keep season identity so future
+        # action/tactile windows never cross an episode boundary.
+        all_episodes = [
+            (dataset_index, episode_index)
+            for dataset_index, dataset in enumerate(self._all_datasets)
+            for episode_index in range(dataset.meta.total_episodes)
+        ]
+        if len(all_episodes) < 2:
+            raise ValueError("At least two episodes are required to create a validation split")
         rng = np.random.RandomState(seed)
-        perm = rng.permutation(n_ep)
-        n_val = max(1, int(n_ep * val_ratio))
-        val_eps = sorted(perm[:n_val].tolist())
-        train_eps = sorted(perm[n_val:].tolist())
-        repo_id = getattr(self.config, "lerobot_repo_id", "") or os.path.basename(self.root.rstrip("/"))
-        dt = self._build_delta_timestamps()
-        val_ds = LeRobotDataset(
-            repo_id,
-            root=self.root,
-            episodes=val_eps,
-            delta_timestamps=dt,
-            tolerance_s=self.video_tolerance_s,
-            video_backend=self.video_backend,
-        )
-        self.ds = LeRobotDataset(
-            repo_id,
-            root=self.root,
-            episodes=train_eps,
-            delta_timestamps=dt,
-            tolerance_s=self.video_tolerance_s,
-            video_backend=self.video_backend,
-        )
-        self.accelerator.print(f"[Origami LeRobot] train/val split: {len(train_eps)}/{len(val_eps)} episodes")
+        n_val = max(1, int(len(all_episodes) * val_ratio))
+        n_val = min(n_val, len(all_episodes) - 1)
+        val_pairs = set(all_episodes[index] for index in rng.permutation(len(all_episodes))[:n_val])
+
+        # Keep at least one training episode in every season. This matters for
+        # unusually large validation ratios and avoids an empty child dataset.
+        for dataset_index, dataset in enumerate(self._all_datasets):
+            season_episodes = {
+                (dataset_index, episode_index)
+                for episode_index in range(dataset.meta.total_episodes)
+            }
+            if season_episodes and season_episodes.issubset(val_pairs):
+                val_pairs.remove(max(season_episodes))
+
+        train_map, val_map = [], []
+        for dataset_index, dataset in enumerate(self._all_datasets):
+            train_map.append([
+                episode_index for episode_index in range(dataset.meta.total_episodes)
+                if (dataset_index, episode_index) not in val_pairs
+            ])
+            val_map.append([
+                episode_index for episode_index in range(dataset.meta.total_episodes)
+                if (dataset_index, episode_index) in val_pairs
+            ])
+
         val = copy.copy(self)
-        val.ds = val_ds
+        val.ds = self._subset_concat_dataset(val_map)
+        self.ds = self._subset_concat_dataset(train_map)
+        self.accelerator.print(
+            f"[Origami LeRobot] train/val split: "
+            f"{sum(len(eps) for eps in train_map)}/{sum(len(eps) for eps in val_map)} episodes, "
+            f"{len(self.ds)}/{len(val.ds)} frames"
+        )
         return val
 
     def _img_to_pil(self, img_t: torch.Tensor) -> PIL.Image.Image:

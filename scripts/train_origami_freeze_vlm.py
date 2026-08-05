@@ -1068,11 +1068,15 @@ def train(args):
         val_dataloader = DataLoader(
             val_dataset, batch_size=args.train_bsz_per_gpu, shuffle=False,
             drop_last=True, collate_fn=val_dataset.collate_fn,
-            num_workers=2, pin_memory=True)
+            num_workers=args.val_num_workers, pin_memory=True)
 
     dataloader = DataLoader(
         dataset, batch_size=args.train_bsz_per_gpu, shuffle=True,
-        collate_fn=dataset.collate_fn, num_workers=4, pin_memory=True,
+        # DeepSpeed's configured micro-batch size is fixed. Dropping the final
+        # partial batch prevents a season-concatenated dataset from producing
+        # a smaller per-rank batch at epoch boundaries.
+        drop_last=True,
+        collate_fn=dataset.collate_fn, num_workers=args.num_workers, pin_memory=True,
     )
 
     num_training_steps = (
@@ -1485,6 +1489,11 @@ if __name__ == "__main__":
                         help="LeRobot dataset dir (required when --data_format lerobot).")
     parser.add_argument("--lerobot_repo_id", type=str, default="",
                         help="Optional repo_id; defaults to basename(lerobot_root).")
+    parser.add_argument("--video_backend", type=str, default=os.environ.get("TREX_VIDEO_BACKEND", "pyav"),
+                        choices=["pyav", "torchcodec", "video_reader"],
+                        help="Video decoder. PyAV is the portable default for the CUDA 12.4 image.")
+    parser.add_argument("--video_tolerance_s", type=float, default=1e-3,
+                        help="Timestamp tolerance used by the LeRobot video decoder.")
     parser.add_argument("--output_dir", type=str, default="./outputs")
     parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument("--max_ckpts", type=int, default=10)
@@ -1499,6 +1508,10 @@ if __name__ == "__main__":
                         help="Save a checkpoint every N training steps (0=disabled).")
     parser.add_argument("--train_bsz_per_gpu", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=int(os.environ.get("TREX_NUM_WORKERS", "4")),
+                        help="Training DataLoader workers per GPU process.")
+    parser.add_argument("--val_num_workers", type=int, default=int(os.environ.get("TREX_VAL_NUM_WORKERS", "2")),
+                        help="Validation DataLoader workers per GPU process.")
     parser.add_argument("--gradient_checkpointing", type=int, default=0,
                         help="1: trade compute for lower activation memory in the MoT decoder.")
     parser.add_argument("--offload_optimizer_device", type=str, default="",

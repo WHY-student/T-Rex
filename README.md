@@ -161,6 +161,12 @@ env path, and the data/checkpoint paths there for your machine (the scripts add
 `PROJECT_ROOT` to `PYTHONPATH` themselves). There is no need to export anything
 globally.
 
+For a new machine, `docker/README.md` documents a CUDA 12.4 image with the
+`trex` environment, mounted multi-season Origami data, and a configurable
+training launcher (`scripts/train_origami_docker.sh`). Two ready-made modes
+are also provided: `scripts/train_origami_docker_freeze_lora.sh` and
+`scripts/train_origami_docker_full_vlm.sh`.
+
 ## Post-training & inference
 
 Fine-tune the released **midtrain** checkpoint on your own task, then serve it.
