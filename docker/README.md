@@ -37,11 +37,29 @@ The image creates the `trex` environment from the `conda-forge` channel, so
 the build does not require accepting Anaconda `pkgs/main` or `pkgs/r` channel
 terms.
 
-## Run training
+## Build the office-inference submission image
 
-The dataset argument can point to the collection root. The launcher scans only
-the immediate `season_*/lerobot3.0` directories and concatenates them without
-copying data:
+For the self-contained `origami-zenoh-v1` policy image, use the production
+Dockerfile and build script below. It embeds the Qwen base model, the selected
+T-Rex checkpoint, tokenizer/processor, normalization statistics, and the
+office Zenoh entrypoint; it does not use runtime source or checkpoint mounts.
+
+```bash
+./docker/build_office.sh fold-the-world/origami-policy:submission
+```
+
+The image uses CUDA 12.4 and the same Python 3.10 `trex` environment. Its
+fixed action horizon is 16, matching the checkpoint's `action_chunk=16`.
+See [`README_office_inference.md`](README_office_inference.md) for the
+runtime and black-box validator commands.
+
+## Run Origami training
+
+The current Origami training entrypoint is
+`scripts/train_origami_freeze_vlm.py`. The dataset argument can point either
+to the merged LeRobot directory itself (`.../lerobot3.0`, containing
+`meta/info.json`) or to its parent collection root. The loader opens each
+season independently and discards complete episodes longer than 260 seconds:
 
 ```bash
 docker run --rm -it \
@@ -55,10 +73,10 @@ docker run --rm -it \
   -v /new-machine/cache:/mnt/cache \
   trex:cuda12.4 \
   /opt/trex/scripts/train_origami_docker.sh \
-    --dataset-root /mnt/data/Robotic_Origami_Challenge \
+    --dataset-root /mnt/data/Robotic_Origami_Challenge/lerobot3.0 \
     --gpus 0,1 \
-    --batch-size 8 \
-    --steps 50000 \
+    --batch-size 16 \
+    --epochs 3 \
     --save-steps 1000 \
     --checkpoint-dir /mnt/checkpoints/T-Rex-origami-posttrain
 ```
@@ -72,19 +90,20 @@ There are two mode-specific launchers. They use the same image and dataset
 mounts, but write to different default checkpoint directories:
 
 ```bash
-# Freeze VLM + Action-LoRA (default batch size: 1 per GPU)
+# Freeze VLM + Action-LoRA (default batch size: 16 per GPU, 3 epochs)
 /opt/trex/scripts/train_origami_docker_freeze_lora.sh \
-  --dataset-root /mnt/data/Robotic_Origami_Challenge \
-  --gpus 0,1 --batch-size 8 --steps 50000
+  --dataset-root /mnt/data/Robotic_Origami_Challenge/lerobot3.0 \
+  --gpus 0,1
 
-# Full VLM fine-tuning (default batch size: 1 per GPU)
+# Full VLM fine-tuning (default batch size: 8 per GPU, 3 epochs)
 /opt/trex/scripts/train_origami_docker_full_vlm.sh \
-  --dataset-root /mnt/data/Robotic_Origami_Challenge \
-  --gpus 0,1 --batch-size 1 --steps 50000
+  --dataset-root /mnt/data/Robotic_Origami_Challenge/lerobot3.0 \
+  --gpus 0,1
 ```
 
 The generic `train_origami_docker.sh` remains available when a custom
-combination of `--freeze-vlm` and `--action-lora` is needed.
+combination of `--freeze-vlm` and `--action-lora` is needed. Its defaults
+match the freeze+Action-LoRA three-epoch Origami run.
 
 The default mounted paths are:
 
@@ -104,7 +123,8 @@ Useful controls:
 
 ```text
 --batch-size N       micro-batch per GPU, not the global batch
---steps N            optimizer steps; 0 means use --epochs
+--steps N            optimizer steps; 0 means use --epochs (default: 0)
+--epochs N           epoch limit when --steps is 0 (default: 3)
 --grad-accum N       effective batch = N × GPU count × grad-accum
 --save-steps N       checkpoint interval
 --max-ckpts N        number of retained checkpoint directories
@@ -115,7 +135,8 @@ Useful controls:
 
 The freeze+Action-LoRA mode is the safer starting point for 24-GB cards.
 Full-VLM training normally requires a smaller per-GPU batch and more VRAM;
-the separate launcher starts conservatively with batch size 1.
+the separate launcher starts with batch size 8, matching the current Origami
+full-VLM training script.
 
 ## Preflight without starting training
 
@@ -124,7 +145,7 @@ docker run --rm -it --gpus '"device=0"' \
   -v /new-machine/data/Robotic_Origami_Challenge:/mnt/data/Robotic_Origami_Challenge:ro \
   trex:cuda12.4 \
   python /opt/trex/scripts/check_trex_dataset.py \
-    --dataset-root /mnt/data/Robotic_Origami_Challenge --check-video
+    --dataset-root /mnt/data/Robotic_Origami_Challenge/lerobot3.0 --check-video
 ```
 
 The check verifies every selected season's v3.0 metadata, feature dimensions

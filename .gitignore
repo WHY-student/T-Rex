@@ -34,3 +34,4 @@ scripts/test_output*/
 tactile_vqvae/logs/
 tactile_vqvae/plots*/
 training_data/
+*.tar.gz

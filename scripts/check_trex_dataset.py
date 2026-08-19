@@ -30,7 +30,7 @@ def discover_roots(dataset_root: Path) -> list[Path]:
     if not roots:
         raise FileNotFoundError(
             f"no LeRobot v3.0 data found under {dataset_root}; expected "
-            "<root>/season_*/lerobot3.0/meta/info.json"
+            "either <root>/meta/info.json or <root>/season_*/lerobot3.0/meta/info.json"
         )
     return roots
 
@@ -119,7 +119,7 @@ def validate(dataset_root: Path, check_video: bool) -> int:
     print(
         f"OK: {len(roots)} season(s), {total_episodes:,} episodes, "
         f"{total_frames:,} frames, fps={next(iter(fps_values))}, "
-        "using only season_*/lerobot3.0"
+        "using the current Origami LeRobot path"
     )
     for root in roots:
         print(f"  {root}")

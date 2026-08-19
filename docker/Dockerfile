@@ -70,6 +70,12 @@ RUN python -m pip install -e . --no-deps \
         scripts/train_origami_docker_full_vlm.sh \
         scripts/check_trex_dataset.py
 
+# Keep the image build tied to the current Origami training path.
+RUN python -m py_compile \
+        qwen_vla/origami_lerobot_dataset.py \
+        scripts/train_origami_freeze_vlm.py \
+        scripts/check_trex_dataset.py
+
 ENV PYTHONPATH=/opt/trex:/opt/trex/third_party/lerobot/src \
     HF_HOME=/mnt/cache/huggingface \
     TORCH_HOME=/mnt/cache/torch \

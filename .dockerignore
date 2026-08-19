@@ -1,0 +1,17 @@
+.git
+**/.git
+**/__pycache__
+*.pyc
+*.pyo
+logs
+*.log
+asset
+dataset_quickstart
+hardware_code
+third_party/lerobot/.github
+third_party/lerobot/benchmarks
+third_party/lerobot/docs
+third_party/lerobot/examples
+third_party/lerobot/media
+third_party/lerobot/tests
+third_party/lerobot/*.egg-info

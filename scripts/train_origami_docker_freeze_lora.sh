@@ -7,8 +7,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 : "${TREX_CHECKPOINT_DIR:=/mnt/checkpoints/T-Rex-origami-freeze-lora}"
 : "${TREX_EXPERIMENT_NAME:=t-rex_origami_65d_freeze_vlm}"
-: "${TREX_BATCH_SIZE:=1}"
-export TREX_CHECKPOINT_DIR TREX_EXPERIMENT_NAME TREX_BATCH_SIZE
+: "${TREX_BATCH_SIZE:=16}"
+: "${TREX_STEPS:=0}"
+: "${TREX_EPOCHS:=3}"
+export TREX_CHECKPOINT_DIR TREX_EXPERIMENT_NAME TREX_BATCH_SIZE TREX_STEPS TREX_EPOCHS
 export TREX_FREEZE_VLM=1
 export TREX_ACTION_LORA=1
 

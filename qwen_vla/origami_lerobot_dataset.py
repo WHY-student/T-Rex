@@ -44,6 +44,7 @@ KEY_STATE = "observation.state"
 KEY_ACTION = "action"
 KEY_TACF6 = "observation.tactile"
 KEY_DEFORM = "observation.images.tactile_deform"
+MAX_EPISODE_DURATION_S = 260.0
 
 
 def _normalize(values, mask, vmin, vmax):
@@ -109,6 +110,31 @@ def _jsonable(value):
     return value
 
 
+def _episode_indices_within_duration(
+    dataset_root: Path,
+    fps: int,
+    max_duration_s: float = MAX_EPISODE_DURATION_S,
+) -> tuple[list[int], list[tuple[int, float]]]:
+    """Return episode indices to keep and episodes rejected by duration.
+
+    LeRobot stores episode length in frames. Using length / fps keeps the
+    filter aligned with the timestamps used by the training loader and applies
+    to the whole episode before any frame-level samples are exposed.
+    """
+    from lerobot.datasets.utils import load_episodes
+
+    episodes = load_episodes(dataset_root)
+    kept: list[int] = []
+    discarded: list[tuple[int, float]] = []
+    for episode_index in range(len(episodes)):
+        duration_s = float(episodes[episode_index]["length"]) / float(fps)
+        if duration_s > max_duration_s:
+            discarded.append((episode_index, duration_s))
+        else:
+            kept.append(episode_index)
+    return kept, discarded
+
+
 class _ConcatLeRobotDataset(torch.utils.data.Dataset):
     """A small local-path concat wrapper for LeRobotDataset instances.
 
@@ -146,10 +172,10 @@ class _ConcatLeRobotDataset(torch.utils.data.Dataset):
 class _EpisodeSubset(torch.utils.data.Dataset):
     """Episode-filtered view over an already-open LeRobotDataset.
 
-    Reopening 46 season datasets with ``episodes=...`` makes LeRobot rescan
-    every selected parquet file and rebuild an absolute-index map. The full
-    datasets are already memory-mapped, so a lightweight index view is both
-    faster and substantially less memory hungry for validation splitting.
+    The underlying LeRobot dataset may itself be opened with an episodes
+    filter. Its samples are then addressed by relative indices while the
+    episode metadata retains absolute dataset indices, so this view translates
+    absolute frame ranges back to the underlying relative indices.
     """
 
     def __init__(self, dataset, episode_indices):
@@ -176,7 +202,14 @@ class _EpisodeSubset(torch.utils.data.Dataset):
             idx += len(self)
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds for {len(self)} samples")
-        return self.dataset[int(self.indices[idx])]
+        absolute_index = int(self.indices[idx])
+        absolute_to_relative = getattr(self.dataset, "_absolute_to_relative_idx", None)
+        relative_index = (
+            absolute_to_relative[absolute_index]
+            if absolute_to_relative is not None
+            else absolute_index
+        )
+        return self.dataset[relative_index]
 
 
 class OrigamiLeRobotDataset(torch.utils.data.Dataset):
@@ -195,13 +228,40 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         self.root = str(Path(os.path.expanduser(config.lerobot_root)).resolve())
         self.dataset_roots = discover_lerobot_roots(self.root)
         repo_prefix = getattr(config, "lerobot_repo_id", "") or "origami/local"
+        if episodes is not None and len(self.dataset_roots) != 1:
+            raise ValueError("episodes=... is only supported for one LeRobot root")
+        requested_episodes = None if episodes is None else {int(index) for index in episodes}
 
         infos = []
         native_stats_list = []
+        selected_episode_indices = []
+        active_roots = []
         for dataset_root in self.dataset_roots:
             with open(dataset_root / "meta" / "info.json") as f:
                 info = json.load(f)
+
+            valid_indices, discarded = _episode_indices_within_duration(
+                dataset_root, int(info["fps"])
+            )
+            if discarded:
+                accelerator.print(
+                    f"[Origami LeRobot] {dataset_root}: discarded {len(discarded)} "
+                    f"episodes with duration > {MAX_EPISODE_DURATION_S:.0f}s"
+                )
+            if requested_episodes is not None:
+                valid_indices = [
+                    index for index in valid_indices if index in requested_episodes
+                ]
+            if not valid_indices:
+                accelerator.print(
+                    f"[Origami LeRobot] {dataset_root}: no episodes remain after "
+                    f"the {MAX_EPISODE_DURATION_S:.0f}s duration filter; skipping season"
+                )
+                continue
+
+            active_roots.append(dataset_root)
             infos.append(info)
+            selected_episode_indices.append(valid_indices)
 
             # Use LeRobot's loader so aggregate_stats receives numpy arrays,
             # not the JSON lists stored on disk.
@@ -211,6 +271,14 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
             if native_stats is None:
                 raise FileNotFoundError(f"Missing LeRobot statistics: {dataset_root / 'meta' / 'stats.json'}")
             native_stats_list.append(native_stats)
+
+        self.dataset_roots = active_roots
+        self._selected_episode_indices = selected_episode_indices
+        if not self.dataset_roots:
+            raise ValueError(
+                f"No Origami episodes remain after discarding trajectories longer than "
+                f"{MAX_EPISODE_DURATION_S:.0f}s"
+            )
 
         self.fps = int(infos[0]["fps"])
         if any(int(info["fps"]) != self.fps for info in infos[1:]):
@@ -282,13 +350,11 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
             self.ds = _ds
         else:
             self.ds = self._open_concat_dataset()
-            if episodes is not None:
-                if len(self.dataset_roots) != 1:
-                    raise ValueError("episodes=... is only supported for one LeRobot root")
-                self.ds = self._subset_concat_dataset([episodes])
 
         accelerator.print(
-            f"[Origami LeRobot] {len(self.dataset_roots)} season(s), {len(self.ds)} frames, "
+            f"[Origami LeRobot] {len(self.dataset_roots)} season(s), "
+            f"{sum(len(indices) for indices in self._selected_episode_indices)} episodes, "
+            f"{len(self.ds)} frames, "
             f"fps={self.fps}, roots={self.dataset_roots[0]}"
             + (f" ... {self.dataset_roots[-1]}" if len(self.dataset_roots) > 1 else "")
             + ", "
@@ -302,6 +368,7 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         return LeRobotDataset(
             self._repo_ids[index],
             root=self.dataset_roots[index],
+            episodes=self._selected_episode_indices[index],
             delta_timestamps=self._build_delta_timestamps(),
             tolerance_s=self.video_tolerance_s,
             video_backend=self.video_backend,
@@ -356,7 +423,7 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         all_episodes = [
             (dataset_index, episode_index)
             for dataset_index, dataset in enumerate(self._all_datasets)
-            for episode_index in range(dataset.meta.total_episodes)
+            for episode_index in self._selected_episode_indices[dataset_index]
         ]
         if len(all_episodes) < 2:
             raise ValueError("At least two episodes are required to create a validation split")
@@ -370,7 +437,7 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         for dataset_index, dataset in enumerate(self._all_datasets):
             season_episodes = {
                 (dataset_index, episode_index)
-                for episode_index in range(dataset.meta.total_episodes)
+                for episode_index in self._selected_episode_indices[dataset_index]
             }
             if season_episodes and season_episodes.issubset(val_pairs):
                 val_pairs.remove(max(season_episodes))
@@ -378,17 +445,19 @@ class OrigamiLeRobotDataset(torch.utils.data.Dataset):
         train_map, val_map = [], []
         for dataset_index, dataset in enumerate(self._all_datasets):
             train_map.append([
-                episode_index for episode_index in range(dataset.meta.total_episodes)
+                episode_index for episode_index in self._selected_episode_indices[dataset_index]
                 if (dataset_index, episode_index) not in val_pairs
             ])
             val_map.append([
-                episode_index for episode_index in range(dataset.meta.total_episodes)
+                episode_index for episode_index in self._selected_episode_indices[dataset_index]
                 if (dataset_index, episode_index) in val_pairs
             ])
 
         val = copy.copy(self)
         val.ds = self._subset_concat_dataset(val_map)
         self.ds = self._subset_concat_dataset(train_map)
+        val._selected_episode_indices = val_map
+        self._selected_episode_indices = train_map
         self.accelerator.print(
             f"[Origami LeRobot] train/val split: "
             f"{sum(len(eps) for eps in train_map)}/{sum(len(eps) for eps in val_map)} episodes, "

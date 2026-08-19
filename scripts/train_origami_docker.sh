@@ -18,8 +18,8 @@ LOG_ROOT="${TREX_LOG_DIR:-${OUTPUT_ROOT}/logs}"
 LOG_ROOT_SET=0
 [[ -n "${TREX_LOG_DIR:-}" ]] && LOG_ROOT_SET=1
 GPU_IDS="${TREX_GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0}}"
-BATCH_SIZE="${TREX_BATCH_SIZE:-1}"
-STEPS="${TREX_STEPS:-50000}"
+BATCH_SIZE="${TREX_BATCH_SIZE:-16}"
+STEPS="${TREX_STEPS:-0}"
 EPOCHS="${TREX_EPOCHS:-3}"
 EPOCHS_SET=0
 [[ -n "${TREX_EPOCHS:-}" ]] && EPOCHS_SET=1
@@ -36,7 +36,7 @@ ACTION_LORA="${TREX_ACTION_LORA:-1}"
 ACTION_LORA_RANK="${TREX_ACTION_LORA_RANK:-16}"
 ACTION_LORA_ALPHA="${TREX_ACTION_LORA_ALPHA:-32}"
 ACTION_LORA_DROPOUT="${TREX_ACTION_LORA_DROPOUT:-0.05}"
-OFFLOAD_OPTIMIZER_DEVICE="${TREX_OFFLOAD_OPTIMIZER_DEVICE:-cpu}"
+OFFLOAD_OPTIMIZER_DEVICE="${TREX_OFFLOAD_OPTIMIZER_DEVICE:-}"
 EXPERIMENT_NAME="${TREX_EXPERIMENT_NAME:-t-rex_origami_65d_freeze_vlm}"
 RUN_NAME="${TREX_RUN_NAME:-}"
 RESUME_GLOBAL_STEP="${TREX_RESUME_GLOBAL_STEP:-0}"
@@ -49,7 +49,8 @@ Usage:
   train_origami_docker.sh --dataset-root DATASET_ROOT [options]
 
 Required:
-  --dataset-root PATH       Root containing season_*/lerobot3.0
+  --dataset-root PATH       LeRobot dir with meta/info.json, or a collection
+                            root containing season_*/lerobot3.0
 
 Common options:
   --model-path PATH         Local Qwen3-VL-2B-Instruct directory
@@ -58,8 +59,8 @@ Common options:
   --checkpoint-dir PATH     Base output directory for checkpoints
   --gpus IDS                all or a list visible inside the process, e.g. 0,1
   --batch-size N             Per-GPU micro-batch size
-  --steps N                  Optimizer steps; 0 disables step limit
-  --epochs N                 Epoch limit when --steps 0 (or an explicit upper bound)
+  --steps N                  Optimizer steps; default 0 (epoch-based training)
+  --epochs N                 Epoch limit when --steps 0; default 3
   --save-steps N             Checkpoint interval
   --grad-accum N             Gradient accumulation steps
   --full-vlm                 Train the VLM instead of freeze+Action-LoRA
@@ -128,7 +129,11 @@ done
 (( BATCH_SIZE > 0 )) || die "batch size must be > 0"
 (( GRAD_ACCUM > 0 )) || die "gradient accumulation must be > 0"
 (( NUM_WORKERS >= 0 && VAL_NUM_WORKERS >= 0 )) || die "worker counts must be >= 0"
-(( EPOCHS_SET == 1 || STEPS > 0 )) || die "set --steps > 0 or explicitly provide --epochs"
+if (( STEPS == 0 && EPOCHS_SET == 0 )); then
+    # The Docker default is the current three-epoch Origami run.
+    EPOCHS_SET=1
+fi
+(( EPOCHS > 0 )) || die "--epochs must be > 0"
 
 if [[ -z "$DEFORM_ENCODER_PATH" && -n "$RESUME_CHECKPOINT" ]]; then
     DEFORM_ENCODER_PATH="${RESUME_CHECKPOINT%/}/deform_encoder_from_model_pt.pth"
@@ -229,7 +234,6 @@ TRAIN_ARGS=(
     --weight_decay 0
     --gradient_accumulation_steps "$GRAD_ACCUM"
     --gradient_checkpointing 1
-    --offload_optimizer_device "$OFFLOAD_OPTIMIZER_DEVICE"
     --output_dir "$OUTPUT_ROOT"
     --log_dir "$LOG_ROOT"
     --experiment_name "$EXPERIMENT_NAME"
@@ -267,6 +271,9 @@ TRAIN_ARGS=(
     --val_freq "$VAL_FREQ"
     --max_val_batches "$MAX_VAL_BATCHES"
 )
+if [[ -n "$OFFLOAD_OPTIMIZER_DEVICE" ]]; then
+    TRAIN_ARGS+=(--offload_optimizer_device "$OFFLOAD_OPTIMIZER_DEVICE")
+fi
 if [[ -n "$DEFORM_ENCODER_PATH" ]]; then
     TRAIN_ARGS+=(--deform_encoder_ckpt "$DEFORM_ENCODER_PATH")
 fi
@@ -294,14 +301,14 @@ CMD=(
 )
 
 echo "T-Rex launch summary:"
-echo "  dataset:      $DATASET_ROOT (season_*/lerobot3.0 only)"
+echo "  dataset:      $DATASET_ROOT (Origami LeRobot v3.0)"
 echo "  model:        $MODEL_PATH"
 echo "  resume:       ${RESUME_CHECKPOINT:-<none>}"
 echo "  GPUs:         $GPU_IDS ($GPU_COUNT process(es))"
 echo "  batch/GPU:    $BATCH_SIZE; grad_accum: $GRAD_ACCUM"
 echo "  steps/epochs: $STEPS / $EPOCHS"
 echo "  checkpoints:  $OUTPUT_ROOT/$EXPERIMENT_NAME/$RUN_NAME"
-echo "  video:        pyav"
+echo "  video:        pyav; episodes >260s are discarded by the loader"
 
 if (( DRY_RUN == 1 )); then
     printf 'Command:'
