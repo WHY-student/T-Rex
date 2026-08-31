@@ -44,6 +44,7 @@ from transformers import AutoProcessor, set_seed
 from datasets import Dataset as HFDataset
 
 from qwen_vla import Qwen3VLVLAModel, extend_position_ids_for_flare, split_slow_fast_embeds
+from qwen_vla.m3_masking import make_m3_attention_mask, rescale_visible_queries, sample_m3_visibility
 import cv2
 
 logger = logging.getLogger(__name__)
@@ -521,6 +522,11 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
                 "cascaded_total_steps": getattr(args, "cascaded_total_steps", 10),
                 "cascaded_split_step":  getattr(args, "cascaded_split_step", 6),
                 "flare_frame_stride": getattr(args, "flare_frame_stride", 2),
+                "m3_enable": getattr(args, "m3_enable", 0),
+                "m3_vision_mask_prob": getattr(args, "m3_vision_mask_prob", 0.5),
+                "m3_language_mask_prob": getattr(args, "m3_language_mask_prob", 0.1),
+                "m3_query_mask_prob": getattr(args, "m3_query_mask_prob", 0.1),
+                "m3_tactile_mask_prob": getattr(args, "m3_tactile_mask_prob", 0.1),
             }, f, indent=2)
 
         with open(os.path.join(save_dir, "stats_data.json"), "w") as f:
@@ -951,6 +957,7 @@ def train(args):
             n_slow_imgs = batch["n_slow_images"]
             grid_thw = batch.get("image_grid_thw")
             B = inputs_embeds.shape[0]
+            n_slow_img_tokens = 0
             if grid_thw is not None and grid_thw.shape[0] > n_slow_imgs:
                 merge = getattr(raw_model.visual, "spatial_merge_size",
                                 getattr(processor.image_processor, "merge_size", 2))
@@ -965,6 +972,13 @@ def train(args):
             else:
                 slow_embeds = inputs_embeds
                 fast_embeds = inputs_embeds[:, :0]
+                if grid_thw is not None:
+                    # All processor images are slow in this branch.  The
+                    # count is per sample and is constant for a padded batch.
+                    n_slow_img_tokens = int(
+                        (batch["input_ids"] == raw_model.image_token_id)
+                        .sum(dim=1).min().item()
+                    )
 
             L_slow = slow_embeds.shape[1]
             
@@ -1008,6 +1022,33 @@ def train(args):
             chunk = args.action_chunk
             target = batch["target"].to(slow_embeds.dtype)
             n_fast = fast_embeds.shape[1]
+            m3 = None
+            model_attention_mask = batch["attention_mask"]
+            if getattr(args, "m3_enable", 0):
+                m3 = sample_m3_visibility(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    image_token_id=raw_model.image_token_id,
+                    n_slow_img_tokens=n_slow_img_tokens,
+                    slow_len=L_slow,
+                    n_flare_tokens=L_latent - L_slow,
+                    n_fast=n_fast,
+                    n_state=n_state,
+                    n_action_queries=chunk,
+                    vision_mask_prob=args.m3_vision_mask_prob,
+                    language_mask_prob=args.m3_language_mask_prob,
+                    query_mask_prob=args.m3_query_mask_prob,
+                    tactile_mask_prob=args.m3_tactile_mask_prob,
+                )
+                noisy_actions = rescale_visible_queries(
+                    noisy_actions,
+                    m3["action_query_visibility"],
+                    args.m3_query_mask_prob,
+                )
+                model_attention_mask = make_m3_attention_mask(
+                    m3["full_visibility"],
+                    dtype=slow_embeds.dtype,
+                )
             r_target_norm = None  # set only when tactile expert ran this step
 
             has_any_tac = bool(args.use_tactile_vec or args.use_tactile_deform)
@@ -1024,7 +1065,7 @@ def train(args):
             outputs = model.model(
                 inputs_embeds=full_embeds,
                 position_ids=pos_ids,
-                attention_mask=batch["attention_mask"],
+                attention_mask=model_attention_mask,
                 use_cache=False,
                 output_hidden_states=use_flare,
                 latent_indexes=torch.arange(0, L_latent, device=full_embeds.device),
@@ -1058,6 +1099,18 @@ def train(args):
                             num_steps_total=args.cascaded_total_steps,
                             split_step=args.cascaded_split_step,
                             refresh_clean_kv=True,
+                            m3_latent_visibility=(
+                                m3["latent_visibility"] if m3 is not None else None
+                            ),
+                            m3_fast_visibility=(
+                                m3["fast_visibility"] if m3 is not None else None
+                            ),
+                            m3_action_query_visibility=(
+                                m3["action_query_visibility"] if m3 is not None else None
+                            ),
+                            m3_query_mask_prob=(
+                                args.m3_query_mask_prob if m3 is not None else 0.0
+                            ),
                         ))
 
                 # 2) L_flow_tactile — tactile expert predicts velocity at
@@ -1109,6 +1162,18 @@ def train(args):
                         tactile_deform=tac_def_in,
                         tactile_codes=tac_codes_in,
                         tactile_f6_history=tac_hist_in,
+                        m3_prefix_visibility=(
+                            m3["full_visibility"] if m3 is not None else None
+                        ),
+                        m3_tactile_keep=(
+                            m3["tactile_keep"] if m3 is not None else None
+                        ),
+                        m3_action_query_visibility=(
+                            m3["action_query_visibility"] if m3 is not None else None
+                        ),
+                        m3_query_mask_prob=(
+                            args.m3_query_mask_prob if m3 is not None else 0.0
+                        ),
                     ),
                     v_target_r,
                 )
@@ -1199,6 +1264,13 @@ def train(args):
                         "flare_loss":  m["flare_loss"],
                         "lr": lr_now,
                     }
+                    if m3 is not None:
+                        log_dict.update({
+                            "m3/vision_visible": float(m3["vision_keep"].float().mean().item()),
+                            "m3/language_visible": float(m3["language_keep"].float().mean().item()),
+                            "m3/tactile_visible": float(m3["tactile_keep"].float().mean().item()),
+                            "m3/query_visible": float(m3["action_query_visibility"].float().mean().item()),
+                        })
                     if r_target_norm is not None:
                         log_dict["refine/r_target_norm"] = float(r_target_norm)
                     wandb.log(log_dict, step=global_step)
@@ -1288,6 +1360,19 @@ if __name__ == "__main__":
     parser.add_argument("--cascaded_loss_weight", type=float, default=1.0,
                         help="Weight on the L_flow_tactile loss term.")
 
+    # M3 structured modality masking (training only).  Defaults preserve the
+    # historical T-Rex objective; enable explicitly for an M3 experiment.
+    parser.add_argument("--m3_enable", type=int, default=0,
+                        help="1: enable training-time structured M3 masking.")
+    parser.add_argument("--m3_vision_mask_prob", type=float, default=0.5,
+                        help="Probability of jointly masking both wrist views.")
+    parser.add_argument("--m3_language_mask_prob", type=float, default=0.1,
+                        help="Probability of masking the language-side prefix.")
+    parser.add_argument("--m3_query_mask_prob", type=float, default=0.1,
+                        help="Probability of masking each noisy action query.")
+    parser.add_argument("--m3_tactile_mask_prob", type=float, default=0.1,
+                        help="Probability of jointly masking tactile observation tokens.")
+
     # VQ-VAE tactile code tokens (fast-path only; pre-baked into the JSON via
     # utils/encode_vqvae_codes_to_json.py).  When 0 (default), no tactile_code
     # embedder is created and the model graph is identical to the pre-feature
@@ -1337,4 +1422,3 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
 
     train(args)
-

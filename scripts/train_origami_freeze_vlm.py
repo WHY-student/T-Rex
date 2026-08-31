@@ -44,10 +44,36 @@ from transformers import AutoProcessor, set_seed
 from datasets import Dataset as HFDataset
 
 from qwen_vla import Qwen3VLVLAModel, extend_position_ids_for_flare, split_slow_fast_embeds
+from qwen_vla.m3_masking import make_m3_attention_mask, rescale_visible_queries, sample_m3_visibility
 import cv2
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level="INFO")
+
+
+ACTION_LORA_TARGET_SUFFIXES = (
+    "q_proj_action",
+    "k_proj_action",
+    "v_proj_action",
+    "o_proj_action",
+    "mlp_action.gate_proj",
+    "mlp_action.up_proj",
+    "mlp_action.down_proj",
+)
+
+# These are the latent/text expert projections in the Qwen MoT decoder.  The
+# visual tower is intentionally not included: it remains frozen as in the
+# existing T-Rex training recipe.  The *_action and *_tactile experts have
+# distinct names and therefore cannot be wrapped by these suffixes.
+VLM_LORA_TARGET_SUFFIXES = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
 
 
 def _rot6d_to_mat(rot6d):
@@ -139,18 +165,9 @@ class LoRALinear(nn.Module):
 
 
 def inject_action_expert_lora(model: nn.Module, rank: int, alpha: float, dropout: float):
-    target_suffixes = (
-        "q_proj_action",
-        "k_proj_action",
-        "v_proj_action",
-        "o_proj_action",
-        "mlp_action.gate_proj",
-        "mlp_action.up_proj",
-        "mlp_action.down_proj",
-    )
     replacements = []
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and name.endswith(target_suffixes):
+        if isinstance(module, nn.Linear) and name.endswith(ACTION_LORA_TARGET_SUFFIXES):
             parent_name, child_name = name.rsplit(".", 1)
             replacements.append((parent_name, child_name, module))
 
@@ -162,17 +179,35 @@ def inject_action_expert_lora(model: nn.Module, rank: int, alpha: float, dropout
     return len(replacements)
 
 
-def remap_base_linear_keys_for_lora(state_dict):
+def inject_vlm_lora(model: nn.Module, rank: int, alpha: float, dropout: float):
+    """Wrap latent/text expert projections with trainable VLM LoRA adapters."""
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and name.endswith(VLM_LORA_TARGET_SUFFIXES):
+            parent_name, child_name = name.rsplit(".", 1)
+            replacements.append((parent_name, child_name, module))
+
+    module_lookup = dict(model.named_modules())
+    for parent_name, child_name, module in replacements:
+        parent = module_lookup[parent_name]
+        setattr(parent, child_name, LoRALinear(module, rank, alpha, dropout))
+
+    return len(replacements)
+
+
+def remap_base_linear_keys_for_lora(
+    state_dict, *, action_lora: bool = True, vlm_lora: bool = False
+):
     """Map pre-LoRA Linear checkpoint keys onto LoRALinear.base keys."""
-    target_suffixes = (
-        "q_proj_action",
-        "k_proj_action",
-        "v_proj_action",
-        "o_proj_action",
-        "mlp_action.gate_proj",
-        "mlp_action.up_proj",
-        "mlp_action.down_proj",
+    target_suffixes = tuple(
+        suffixes
+        for enabled, suffixes in (
+            (action_lora, ACTION_LORA_TARGET_SUFFIXES),
+            (vlm_lora, VLM_LORA_TARGET_SUFFIXES),
+        )
+        if enabled
     )
+    target_suffixes = tuple(item for group in target_suffixes for item in group)
     remapped = {}
     for key, value in state_dict.items():
         if key.endswith((".weight", ".bias")):
@@ -594,10 +629,20 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
                 "action_lora_rank": getattr(args, "action_lora_rank", None),
                 "action_lora_alpha": getattr(args, "action_lora_alpha", None),
                 "action_lora_dropout": getattr(args, "action_lora_dropout", None),
+                "vlm_lora": getattr(args, "vlm_lora", 0),
+                "vlm_lora_rank": getattr(args, "vlm_lora_rank", None),
+                "vlm_lora_alpha": getattr(args, "vlm_lora_alpha", None),
+                "vlm_lora_dropout": getattr(args, "vlm_lora_dropout", None),
+                "freeze_vlm": getattr(args, "freeze_vlm", 0),
                 "paradigm": "cascaded",
                 "cascaded_total_steps": getattr(args, "cascaded_total_steps", 10),
                 "cascaded_split_step":  getattr(args, "cascaded_split_step", 6),
                 "flare_frame_stride": getattr(args, "flare_frame_stride", 2),
+                "m3_enable": getattr(args, "m3_enable", 0),
+                "m3_vision_mask_prob": getattr(args, "m3_vision_mask_prob", 0.5),
+                "m3_language_mask_prob": getattr(args, "m3_language_mask_prob", 0.1),
+                "m3_query_mask_prob": getattr(args, "m3_query_mask_prob", 0.1),
+                "m3_tactile_mask_prob": getattr(args, "m3_tactile_mask_prob", 0.1),
             }, f, indent=2)
 
         if stats_data is not None:
@@ -910,6 +955,19 @@ def train(args):
                     param.data.copy_(named_params[base].data)
         accelerator.print("Action expert initialized from latent expert.")
 
+    if getattr(args, "vlm_lora", 0):
+        n_vlm_lora_modules = inject_vlm_lora(
+            model,
+            rank=args.vlm_lora_rank,
+            alpha=args.vlm_lora_alpha,
+            dropout=args.vlm_lora_dropout,
+        )
+        accelerator.print(
+            f"VLM LoRA enabled: {n_vlm_lora_modules} latent Linear modules, "
+            f"rank={args.vlm_lora_rank}, alpha={args.vlm_lora_alpha}, "
+            f"dropout={args.vlm_lora_dropout}"
+        )
+
     if getattr(args, "action_lora", 0):
         n_lora_modules = inject_action_expert_lora(
             model,
@@ -930,8 +988,12 @@ def train(args):
         resume_sd = torch.load(ckpt_path, map_location="cpu")
         if "state_dict" in resume_sd:
             resume_sd = resume_sd["state_dict"]
-        if getattr(args, "action_lora", 0):
-            resume_sd = remap_base_linear_keys_for_lora(resume_sd)
+        if getattr(args, "action_lora", 0) or getattr(args, "vlm_lora", 0):
+            resume_sd = remap_base_linear_keys_for_lora(
+                resume_sd,
+                action_lora=bool(getattr(args, "action_lora", 0)),
+                vlm_lora=bool(getattr(args, "vlm_lora", 0)),
+            )
         # Filter out keys with shape mismatch (e.g. tactile MLP from pretrain)
         model_sd = model.state_dict()
         filtered_sd = {}
@@ -988,7 +1050,16 @@ def train(args):
         else:
             param.requires_grad = True
     if getattr(args, "freeze_vlm", 0):
-        if getattr(args, "action_lora", 0):
+        if getattr(args, "vlm_lora", 0) and getattr(args, "action_lora", 0):
+            accelerator.print(
+                "VLM/action expert base frozen; training VLM-LoRA, action LoRA, "
+                "and task heads/projections."
+            )
+        elif getattr(args, "vlm_lora", 0):
+            accelerator.print(
+                "VLM base frozen; training VLM-LoRA and task heads/projections."
+            )
+        elif getattr(args, "action_lora", 0):
             accelerator.print("VLM/action expert base frozen; training action LoRA adapters and task heads/projections.")
         else:
             accelerator.print("VLM backbone frozen; training task heads/projections only.")
@@ -1009,8 +1080,13 @@ def train(args):
             if p.requires_grad and ("lora_A" in n or "lora_B" in n)
         )
         small_head_trainable = trainable - lora_trainable
+        adapter_label = []
+        if getattr(args, "vlm_lora", 0):
+            adapter_label.append("VLM-LoRA")
+        if getattr(args, "action_lora", 0):
+            adapter_label.append("Action-LoRA")
         accelerator.print(
-            f"Trainable action LoRA: {lora_trainable/1e6:.1f}M parameters; "
+            f"Trainable {' + '.join(adapter_label) or 'LoRA'}: {lora_trainable/1e6:.1f}M parameters; "
             f"task heads/projections: {small_head_trainable/1e6:.1f}M parameters"
         )
 
@@ -1184,6 +1260,7 @@ def train(args):
             n_slow_imgs = batch["n_slow_images"]
             grid_thw = batch.get("image_grid_thw")
             B = inputs_embeds.shape[0]
+            n_slow_img_tokens = 0
             if grid_thw is not None and grid_thw.shape[0] > n_slow_imgs:
                 merge = getattr(raw_model.visual, "spatial_merge_size",
                                 getattr(processor.image_processor, "merge_size", 2))
@@ -1198,6 +1275,11 @@ def train(args):
             else:
                 slow_embeds = inputs_embeds
                 fast_embeds = inputs_embeds[:, :0]
+                if grid_thw is not None:
+                    n_slow_img_tokens = int(
+                        (batch["input_ids"] == raw_model.image_token_id)
+                        .sum(dim=1).min().item()
+                    )
 
             L_slow = slow_embeds.shape[1]
             
@@ -1241,6 +1323,32 @@ def train(args):
             chunk = args.action_chunk
             target = batch["target"].to(slow_embeds.dtype)
             n_fast = fast_embeds.shape[1]
+            m3 = None
+            model_attention_mask = batch["attention_mask"]
+            if getattr(args, "m3_enable", 0):
+                m3 = sample_m3_visibility(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    image_token_id=raw_model.image_token_id,
+                    n_slow_img_tokens=n_slow_img_tokens,
+                    slow_len=L_slow,
+                    n_flare_tokens=L_latent - L_slow,
+                    n_fast=n_fast,
+                    n_state=n_state,
+                    n_action_queries=chunk,
+                    vision_mask_prob=args.m3_vision_mask_prob,
+                    language_mask_prob=args.m3_language_mask_prob,
+                    query_mask_prob=args.m3_query_mask_prob,
+                    tactile_mask_prob=args.m3_tactile_mask_prob,
+                )
+                noisy_actions = rescale_visible_queries(
+                    noisy_actions,
+                    m3["action_query_visibility"],
+                    args.m3_query_mask_prob,
+                )
+                model_attention_mask = make_m3_attention_mask(
+                    m3["full_visibility"], dtype=slow_embeds.dtype
+                )
             r_target_norm = None  # set only when tactile expert ran this step
 
             has_any_tac = bool(args.use_tactile_vec or args.use_tactile_deform)
@@ -1257,7 +1365,7 @@ def train(args):
             outputs = model.model(
                 inputs_embeds=full_embeds,
                 position_ids=pos_ids,
-                attention_mask=batch["attention_mask"],
+                attention_mask=model_attention_mask,
                 use_cache=False,
                 output_hidden_states=(use_flare and flare_layer_idx != -1),
                 latent_indexes=torch.arange(0, L_latent, device=full_embeds.device),
@@ -1291,6 +1399,18 @@ def train(args):
                             num_steps_total=args.cascaded_total_steps,
                             split_step=args.cascaded_split_step,
                             refresh_clean_kv=True,
+                            m3_latent_visibility=(
+                                m3["latent_visibility"] if m3 is not None else None
+                            ),
+                            m3_fast_visibility=(
+                                m3["fast_visibility"] if m3 is not None else None
+                            ),
+                            m3_action_query_visibility=(
+                                m3["action_query_visibility"] if m3 is not None else None
+                            ),
+                            m3_query_mask_prob=(
+                                args.m3_query_mask_prob if m3 is not None else 0.0
+                            ),
                         ))
 
                 # 2) L_flow_tactile — tactile expert predicts velocity at
@@ -1342,6 +1462,18 @@ def train(args):
                         tactile_deform=tac_def_in,
                         tactile_codes=tac_codes_in,
                         tactile_f6_history=tac_hist_in,
+                        m3_prefix_visibility=(
+                            m3["full_visibility"] if m3 is not None else None
+                        ),
+                        m3_tactile_keep=(
+                            m3["tactile_keep"] if m3 is not None else None
+                        ),
+                        m3_action_query_visibility=(
+                            m3["action_query_visibility"] if m3 is not None else None
+                        ),
+                        m3_query_mask_prob=(
+                            args.m3_query_mask_prob if m3 is not None else 0.0
+                        ),
                     ),
                     v_target_r,
                 )
@@ -1432,6 +1564,13 @@ def train(args):
                         "flare_loss":  m["flare_loss"],
                         "lr": lr_now,
                     }
+                    if m3 is not None:
+                        log_dict.update({
+                            "m3/vision_visible": float(m3["vision_keep"].float().mean().item()),
+                            "m3/language_visible": float(m3["language_keep"].float().mean().item()),
+                            "m3/tactile_visible": float(m3["tactile_keep"].float().mean().item()),
+                            "m3/query_visible": float(m3["action_query_visibility"].float().mean().item()),
+                        })
                     if r_target_norm is not None:
                         log_dict["refine/r_target_norm"] = float(r_target_norm)
                     wandb.log(log_dict, step=global_step)
@@ -1522,6 +1661,11 @@ if __name__ == "__main__":
     parser.add_argument("--action_lora_rank", type=int, default=16)
     parser.add_argument("--action_lora_alpha", type=float, default=32.0)
     parser.add_argument("--action_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--vlm_lora", type=int, default=0,
+                        help="1: freeze latent/text VLM base weights and train LoRA adapters on its attention and MLP Linear layers.")
+    parser.add_argument("--vlm_lora_rank", type=int, default=16)
+    parser.add_argument("--vlm_lora_alpha", type=float, default=32.0)
+    parser.add_argument("--vlm_lora_dropout", type=float, default=0.05)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--min_lr_ratio", type=float, default=0.0)
     parser.add_argument("--warmup_rates", type=float, default=0.0)
@@ -1573,6 +1717,19 @@ if __name__ == "__main__":
     parser.add_argument("--cascaded_loss_weight", type=float, default=1.0,
                         help="Weight on the L_flow_tactile loss term.")
 
+    # M3 structured modality masking (training only).  Defaults preserve the
+    # historical T-Rex objective; enable explicitly for an M3 experiment.
+    parser.add_argument("--m3_enable", type=int, default=0,
+                        help="1: enable training-time structured M3 masking.")
+    parser.add_argument("--m3_vision_mask_prob", type=float, default=0.5,
+                        help="Probability of jointly masking both wrist views.")
+    parser.add_argument("--m3_language_mask_prob", type=float, default=0.1,
+                        help="Probability of masking the language-side prefix.")
+    parser.add_argument("--m3_query_mask_prob", type=float, default=0.1,
+                        help="Probability of masking each noisy action query.")
+    parser.add_argument("--m3_tactile_mask_prob", type=float, default=0.1,
+                        help="Probability of jointly masking tactile observation tokens.")
+
     # VQ-VAE tactile code tokens (fast-path only; pre-baked into the JSON via
     # utils/encode_vqvae_codes_to_json.py).  When 0 (default), no tactile_code
     # embedder is created and the model graph is identical to the pre-feature
@@ -1609,6 +1766,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_val_batches", type=int, default=50, help="Max batches per validation run")
 
     args = parser.parse_args()
+
+    # LoRA fine-tuning means the VLM base remains frozen while its adapter
+    # weights are trainable.  Make this invariant explicit even if a caller
+    # accidentally combines --vlm_lora 1 with --freeze_vlm 0.
+    if args.vlm_lora:
+        args.freeze_vlm = 1
 
     if args.data_format == "lerobot":
         if not args.lerobot_root:

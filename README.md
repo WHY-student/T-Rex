@@ -163,9 +163,10 @@ globally.
 
 For a new machine, `docker/README.md` documents a CUDA 12.4 image with the
 `trex` environment, mounted multi-season Origami data, and a configurable
-training launcher (`scripts/train_origami_docker.sh`). Two ready-made modes
-are also provided: `scripts/train_origami_docker_freeze_lora.sh` and
-`scripts/train_origami_docker_full_vlm.sh`.
+training launcher (`scripts/train_origami_docker.sh`). The recommended
+Origami mode trains latent/text VLM-LoRA together with Action-LoRA:
+`scripts/train_origami_docker_vlm_action_lora.sh`. The full-VLM launcher is
+still available as a separate high-memory option.
 
 ## Post-training & inference
 
@@ -177,6 +178,32 @@ Edit the path variables at the top of each `.sh`, then run it.
 | **Post-train** | `scripts/train.sh` | `DATA_JSON` (or `LEROBOT_ROOT`), `ORIGIN_MODEL_PATH`, `DEFORM_ENCODER_PATH`, `RESUME_CHECKPOINT` | Task-specific fine-tune on a small JSON or LeRobot dataset, resuming from the released midtrain checkpoint. Tactile codes are encoded on the fly; the embedded VQ-VAE is auto-detected from the checkpoint (no `VQVAE_CKPT` needed). `RESUME_SOURCE=midtrain` keeps the tactile expert as-is. |
 | **Inference** | `scripts/test.sh` | `MODEL_PATH` | ZMQ REP server speaking the slow/fast cascaded protocol. Auto-detects architecture + embedded VQ-VAE from the checkpoint's `training_args.json`. |
 | **LoRA inference** | `scripts/lora_test.py` | `--checkpoint_path`, `--lerobot_root` | Same server with strict loading and a hard requirement that Action-LoRA tensors are present and reconstructed. |
+
+### Optional M3 modality masking
+
+The post-training loop also supports the structured, training-only mask from
+the local M3 paper.  T-Rex keeps the head/ego view visible, jointly masks both
+wrist views, can mask the language prefix, independently masks noisy action
+queries, and applies one shared mask bit to the tactile observation tokens
+(F6/deformation/VQ-VAE code).  Inference is unchanged and uses the complete
+observation sequence.
+
+The default is disabled for checkpoint and baseline compatibility.  Enable it
+explicitly for an experiment, for example:
+
+```bash
+M3_ENABLE=1 \
+M3_VISION_MASK_PROB=0.5 \
+M3_LANGUAGE_MASK_PROB=0.1 \
+M3_QUERY_MASK_PROB=0.1 \
+M3_TACTILE_MASK_PROB=0.1 \
+bash scripts/train_origami_2x4090_50k_freeze_vlm.sh
+```
+
+For the portable Docker launcher, use the corresponding `TREX_M3_*`
+environment variables.  The paper reports the query-mask ablation at 0.1;
+the other values above are starting points, and the tactile probability is a
+T-Rex-specific extension.
 
 Each `.sh` is a plain script: paths are direct variable assignments at the top,
 the conda env + exports are in the header, and the launch command follows. Only
@@ -209,6 +236,11 @@ T-Rex/scripts/lora_test.sh
 dataset and `trex` conda interpreter. Override with
 `TREX_LORA_CHECKPOINT`, `TREX_LEROBOT_ROOT`, `TREX_CUDA_INDEX` or
 `TREX_SERVER_PORT`.
+
+Checkpoints produced by the VLM-LoRA recipe persist both adapter layouts and
+inference reconstructs latent/text VLM-LoRA and Action-LoRA before strict
+loading. VLM-LoRA freezes the VLM base weights; its attention/MLP adapter
+parameters remain trainable alongside the T-Rex task heads/projections.
 
 The robot-side client that drives this server on the real Vega-1 (REQ socket,
 slow every chunk start, tactile-only fast ticks in between) is
@@ -355,16 +387,18 @@ checkpoint-{epoch}-{step}/
 
 At inference, `test.py` reads `training_args.json` and auto-restores
 the action/state dimensions, action chunk, tactile/flare/VQ-VAE modules,
-cascaded schedule, image size, and action-expert LoRA layout before loading
-weights. Loading is strict by default so a partially random action expert
-cannot be hidden by `strict=False`. Native LeRobot `meta/stats.json` and legacy
+cascaded schedule, image size, latent/text VLM-LoRA, and action-expert LoRA
+layouts before loading weights. Loading is strict by default so a partially
+random expert cannot be hidden by `strict=False`. Native LeRobot `meta/stats.json` and legacy
 T-Rex statistics JSON are both accepted via `--stats_path`. `train.py` likewise
 auto-detects an embedded VQ-VAE from the resume checkpoint.
 
-Older LoRA checkpoints did not store alpha. Rank is inferred from `lora_A`;
+Older LoRA checkpoints did not store alpha. Rank is inferred from the relevant
+`lora_A` tensors;
 when alpha is absent, inference uses the historical post-training default
 `alpha = 2 * rank` and prints a warning. New checkpoints persist
-`action_lora_{rank,alpha,dropout}`, `lerobot_root`, and `image_size`.
+`action_lora_{rank,alpha,dropout}`, `vlm_lora_{rank,alpha,dropout}`,
+`lerobot_root`, and `image_size`.
 
 `Qwen3VLVLAModel` loads checkpoints with `strict=False` and a
 shape-mismatch filter, so checkpoints produced by earlier builds with

@@ -438,8 +438,10 @@ def build_causal_mask(
 ) -> torch.Tensor:
     """
     Returns additive causal mask of shape [1, 1, seq_len, past_len + seq_len].
-    Combines the standard lower-triangular causal mask with an optional padding
-    mask from `attention_mask` (1 = keep, 0 = mask).
+    Combines the standard lower-triangular causal mask with either an optional
+    padding mask from ``attention_mask`` (2-D, 1 = keep, 0 = mask) or an
+    already-built additive mask (4-D, ``[B, 1, query, key]``).  The latter is
+    used by the training-time M3 modality mask.
     """
     total = past_len + seq_len
     # [1, 1, seq_len, total]
@@ -450,24 +452,47 @@ def build_causal_mask(
     mask = mask.masked_fill(causal, 0.0)
 
     if attention_mask is not None:
-        # attention_mask: [batch, L_latent] – 1 means attend, 0 means ignore.
-        # It may be shorter than `total` when action/tactile tokens are appended;
-        # those extra positions are always attended (pad with 1s).
-        B_mask, L_mask = attention_mask.shape
-        if L_mask < total:
-            attention_mask = torch.cat(
-                [attention_mask,
-                 torch.ones(B_mask, total - L_mask, device=device,
-                            dtype=attention_mask.dtype)],
-                dim=1,
+        if attention_mask.ndim == 2:
+            # attention_mask: [batch, L_latent] – 1 means attend, 0 means
+            # ignore.  It may be shorter than `total` when action/tactile
+            # tokens are appended; those extra positions are always attended.
+            B_mask, L_mask = attention_mask.shape
+            if L_mask < total:
+                attention_mask = torch.cat(
+                    [attention_mask,
+                     torch.ones(B_mask, total - L_mask, device=device,
+                                dtype=attention_mask.dtype)],
+                    dim=1,
+                )
+            # NOTE: avoid (1 - mask) * -inf because 0.0 * -inf = NaN in IEEE
+            # 754.  Use masked_fill instead to safely set padded positions.
+            pad_mask = torch.zeros(B_mask, total, dtype=dtype, device=device)
+            pad_mask = pad_mask.masked_fill(
+                attention_mask[:, :total].to(device=device) == 0,
+                float("-inf"),
             )
-        # Expand to [batch, 1, 1, total] and apply.
-        # NOTE: avoid  (1 - mask) * -inf  because  0.0 * -inf = NaN in IEEE 754.
-        # Use masked_fill instead to safely set padded positions to -inf.
-        pad_mask = torch.zeros(B_mask, total, dtype=dtype, device=device)
-        pad_mask = pad_mask.masked_fill(attention_mask[:, :total] == 0, float("-inf"))
-        pad_mask = pad_mask.view(B_mask, 1, 1, total)
-        mask = mask + pad_mask
+            mask = mask + pad_mask.view(B_mask, 1, 1, total)
+        elif attention_mask.ndim == 4:
+            # M3 supplies a query-aware additive mask.  It already contains
+            # row/column visibility decisions; the causal mask above still
+            # enforces the model's original autoregressive ordering.
+            if attention_mask.shape[-2:] != (seq_len, total):
+                raise ValueError(
+                    "4-D attention_mask must have shape "
+                    f"[B, 1, {seq_len}, {total}], got "
+                    f"{tuple(attention_mask.shape)}"
+                )
+            if attention_mask.shape[1] != 1:
+                raise ValueError(
+                    "4-D attention_mask must have one broadcast attention-head "
+                    f"dimension, got {tuple(attention_mask.shape)}"
+                )
+            mask = mask + attention_mask.to(device=device, dtype=dtype)
+        else:
+            raise ValueError(
+                "attention_mask must be 2-D padding or 4-D additive; got "
+                f"{attention_mask.ndim}-D"
+            )
 
         # Ensure every query can attend to at least itself (self-attention on
         # the diagonal).  Without this, left-padded positions have ALL KV

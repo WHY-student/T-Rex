@@ -20,11 +20,16 @@ RESUME_GLOBAL_STEP=${RESUME_GLOBAL_STEP:-0}
 ACTION_LORA_RANK=${ACTION_LORA_RANK:-16}
 ACTION_LORA_ALPHA=${ACTION_LORA_ALPHA:-32}
 ACTION_LORA_DROPOUT=${ACTION_LORA_DROPOUT:-0.05}
+M3_ENABLE=${M3_ENABLE:-0}
+M3_VISION_MASK_PROB=${M3_VISION_MASK_PROB:-0.5}
+M3_LANGUAGE_MASK_PROB=${M3_LANGUAGE_MASK_PROB:-0.1}
+M3_QUERY_MASK_PROB=${M3_QUERY_MASK_PROB:-0.1}
+M3_TACTILE_MASK_PROB=${M3_TACTILE_MASK_PROB:-0.1}
 
 ORIGIN_MODEL_PATH=/data/why/foldVLA/checkpoints/Qwen3-VL-2B-Instruct
 RESUME_CHECKPOINT=${RESUME_CHECKPOINT:-/data/why/foldVLA/checkpoints/T-Rex-midTrain}
 DEFORM_ENCODER_PATH=/data/why/foldVLA/checkpoints/T-Rex-midTrain/deform_encoder_from_model_pt.pth
-LEROBOT_ROOT=/data/why/foldVLA/dataset/Robotic_Origami_Challenge/lerobot3.0
+LEROBOT_ROOT=${LEROBOT_ROOT:-/data/why/foldVLA/dataset/Robotic_Origami_Challenge}
 OUTPUT_ROOT=/data/why/foldVLA/checkpoints/T-Rex-origami-posttrain
 
 EXPERIMENT_NAME=t-rex_origami_65d_freeze_vlm
@@ -79,6 +84,11 @@ conda run --no-capture-output -n trex accelerate launch \
     --cascaded_split_step 6 \
     --cascaded_tactile_dropout 0.1 \
     --cascaded_loss_weight 1.0 \
+    --m3_enable "${M3_ENABLE}" \
+    --m3_vision_mask_prob "${M3_VISION_MASK_PROB}" \
+    --m3_language_mask_prob "${M3_LANGUAGE_MASK_PROB}" \
+    --m3_query_mask_prob "${M3_QUERY_MASK_PROB}" \
+    --m3_tactile_mask_prob "${M3_TACTILE_MASK_PROB}" \
     --resume_checkpoint "${RESUME_CHECKPOINT}" \
     --resume_global_step "${RESUME_GLOBAL_STEP}" \
     --resume_source midtrain \

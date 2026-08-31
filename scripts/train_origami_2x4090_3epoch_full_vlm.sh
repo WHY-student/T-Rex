@@ -15,12 +15,17 @@ export MASTER_PORT=${MASTER_PORT:-29523}
 ORIGIN_MODEL_PATH=/data/why/foldVLA/checkpoints/Qwen3-VL-2B-Instruct
 RESUME_CHECKPOINT=/data/why/foldVLA/checkpoints/T-Rex-midTrain
 DEFORM_ENCODER_PATH=/data/why/foldVLA/checkpoints/T-Rex-midTrain/deform_encoder_from_model_pt.pth
-LEROBOT_ROOT=/data/why/foldVLA/dataset/Robotic_Origami_Challenge/lerobot3.0
+LEROBOT_ROOT=${LEROBOT_ROOT:-/data/why/foldVLA/dataset/Robotic_Origami_Challenge}
 OUTPUT_ROOT=/data/why/foldVLA/checkpoints/T-Rex-origami-posttrain
 SAVE_STEPS=${SAVE_STEPS:-1000}
 TRAIN_BSZ_PER_GPU=${TRAIN_BSZ_PER_GPU:-8}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 OFFLOAD_OPTIMIZER_DEVICE=${OFFLOAD_OPTIMIZER_DEVICE:-cpu}
+M3_ENABLE=${M3_ENABLE:-0}
+M3_VISION_MASK_PROB=${M3_VISION_MASK_PROB:-0.5}
+M3_LANGUAGE_MASK_PROB=${M3_LANGUAGE_MASK_PROB:-0.1}
+M3_QUERY_MASK_PROB=${M3_QUERY_MASK_PROB:-0.1}
+M3_TACTILE_MASK_PROB=${M3_TACTILE_MASK_PROB:-0.1}
 
 EXPERIMENT_NAME=t-rex_origami_65d_full_vlm
 RUN_NAME="${EXPERIMENT_NAME}_2x4090_3epoch_$(date +%m%d_%H%M%S)"
@@ -71,6 +76,11 @@ conda run --no-capture-output -n trex accelerate launch \
     --cascaded_split_step 6 \
     --cascaded_tactile_dropout 0.1 \
     --cascaded_loss_weight 1.0 \
+    --m3_enable "${M3_ENABLE}" \
+    --m3_vision_mask_prob "${M3_VISION_MASK_PROB}" \
+    --m3_language_mask_prob "${M3_LANGUAGE_MASK_PROB}" \
+    --m3_query_mask_prob "${M3_QUERY_MASK_PROB}" \
+    --m3_tactile_mask_prob "${M3_TACTILE_MASK_PROB}" \
     --resume_checkpoint "${RESUME_CHECKPOINT}" \
     --resume_source midtrain \
     --use_flare 1 \

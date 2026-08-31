@@ -2,7 +2,7 @@
 
 This image packages the T-Rex code, the pinned LeRobot reader, and a conda
 environment named `trex` with Python 3.10 and PyTorch 2.6.0/cu124. The dataset,
-Qwen base model, mid-train checkpoint, and post-train outputs stay outside the
+Qwen base model, resume checkpoint, and post-train outputs stay outside the
 image and are mounted at runtime.
 
 ## Build on the new machine
@@ -45,7 +45,7 @@ T-Rex checkpoint, tokenizer/processor, normalization statistics, and the
 office Zenoh entrypoint; it does not use runtime source or checkpoint mounts.
 
 ```bash
-./docker/build_office.sh fold-the-world/origami-policy:submission
+../submission/build_office.sh fold-the-world/origami-policy:submission
 ```
 
 The image uses CUDA 12.4 and the same Python 3.10 `trex` environment. Its
@@ -71,14 +71,10 @@ docker run --rm -it \
   -v /new-machine/models:/mnt/models:ro \
   -v /new-machine/checkpoints:/mnt/checkpoints \
   -v /new-machine/cache:/mnt/cache \
-  trex:cuda12.4 \
-  /opt/trex/scripts/train_origami_docker.sh \
-    --dataset-root /mnt/data/Robotic_Origami_Challenge/lerobot3.0 \
-    --gpus 0,1 \
-    --batch-size 16 \
-    --epochs 3 \
-    --save-steps 1000 \
-    --checkpoint-dir /mnt/checkpoints/T-Rex-origami-posttrain
+  trex:cuda12.4-vlm-lora \
+  /opt/trex/scripts/train_origami_docker_vlm_action_lora.sh \
+    --dataset-root /mnt/data/Robotic_Origami_Challenge \
+    --gpus 0,1
 ```
 
 `--gpus` is interpreted inside the container. If Docker is started with
@@ -86,31 +82,39 @@ docker run --rm -it \
 container. If all host cards are passed through, use `--gpus all` for both
 Docker and the launcher.
 
-There are two mode-specific launchers. They use the same image and dataset
-mounts, but write to different default checkpoint directories:
+The recommended mode-specific launcher trains both latent/text VLM-LoRA and
+Action-LoRA. The VLM and action base weights stay frozen; only the adapters and
+the existing T-Rex task heads/projections are updated. It defaults to 10000
+optimizer steps, M3 masking, and the checkpoint used for this Origami run:
 
 ```bash
-# Freeze VLM + Action-LoRA (default batch size: 16 per GPU, 3 epochs)
+# VLM-LoRA + Action-LoRA (default batch size: 8 per GPU, 10000 steps)
 /opt/trex/scripts/train_origami_docker_freeze_lora.sh \
-  --dataset-root /mnt/data/Robotic_Origami_Challenge/lerobot3.0 \
+  --dataset-root /mnt/data/Robotic_Origami_Challenge \
   --gpus 0,1
 
-# Full VLM fine-tuning (default batch size: 8 per GPU, 3 epochs)
+# The explicit alias has the same configuration:
+/opt/trex/scripts/train_origami_docker_vlm_action_lora.sh \
+  --dataset-root /mnt/data/Robotic_Origami_Challenge \
+  --gpus 0,1
+
+# Optional full-VLM fine-tuning (no LoRA; separate high-memory mode)
 /opt/trex/scripts/train_origami_docker_full_vlm.sh \
-  --dataset-root /mnt/data/Robotic_Origami_Challenge/lerobot3.0 \
+  --dataset-root /mnt/data/Robotic_Origami_Challenge \
   --gpus 0,1
 ```
 
-The generic `train_origami_docker.sh` remains available when a custom
-combination of `--freeze-vlm` and `--action-lora` is needed. Its defaults
-match the freeze+Action-LoRA three-epoch Origami run.
+The generic `train_origami_docker.sh` remains available for custom settings.
+The resume path can always be supplied at runtime with
+`--resume-checkpoint PATH` (or `TREX_RESUME_CHECKPOINT`); it is not baked into
+the image.
 
 The default mounted paths are:
 
 ```text
 /mnt/models/Qwen3-VL-2B-Instruct
-/mnt/checkpoints/T-Rex-midTrain
-/mnt/checkpoints/T-Rex-origami-posttrain
+/mnt/checkpoints/T-Rex-origami-posttrain/checkpoint-0-50000
+/mnt/checkpoints/T-Rex-origami-m3-vlm-action-lora
 ```
 
 Override them with `--model-path`, `--resume-checkpoint`, and
@@ -123,20 +127,42 @@ Useful controls:
 
 ```text
 --batch-size N       micro-batch per GPU, not the global batch
---steps N            optimizer steps; 0 means use --epochs (default: 0)
+--steps N            optimizer steps; 0 means use --epochs (default: 10000)
 --epochs N           epoch limit when --steps is 0 (default: 3)
 --grad-accum N       effective batch = N × GPU count × grad-accum
 --save-steps N       checkpoint interval
 --max-ckpts N        number of retained checkpoint directories
 --num-workers N      video DataLoader workers per GPU process
---full-vlm           disable freeze+Action-LoRA and train the VLM backbone
+--vlm-lora N         train latent/text VLM-LoRA adapters (default: 1)
+--vlm-lora-rank N    VLM-LoRA rank (default: 16)
+--action-lora N      train Action-LoRA adapters (default: 1)
+--full-vlm           disable both LoRA modes and train the full VLM
+--resume-global-step N  starting step for LR/dataloader progress (default wrapper: 50000)
 --dry-run            print the resolved Accelerate command
 ```
 
-The freeze+Action-LoRA mode is the safer starting point for 24-GB cards.
-Full-VLM training normally requires a smaller per-GPU batch and more VRAM;
-the separate launcher starts with batch size 8, matching the current Origami
-full-VLM training script.
+`--resume-checkpoint` defaults to
+`/mnt/checkpoints/T-Rex-origami-posttrain/checkpoint-0-50000` in the Docker
+recipe, but an arbitrary checkpoint directory or `model.pt` can be passed at
+runtime. `--resume-global-step 50000` aligns the new run's LR/dataloader
+progress with `checkpoint-0-50000`; weight-only checkpoints do not restore
+optimizer momentum.
+
+For the second physical RTX 4090 on this host, pass only host GPU 3 to Docker
+and use GPU 0 inside the container:
+
+```bash
+docker run --rm -it --gpus '"device=3"' --ipc=host \
+  -v /data/why/foldVLA/dataset/Robotic_Origami_Challenge:/mnt/data/Robotic_Origami_Challenge:ro \
+  -v /data/why/foldVLA/checkpoints:/mnt/checkpoints \
+  -v /data/why/foldVLA/.cache/trex-docker:/mnt/cache \
+  trex:cuda12.4-vlm-lora \
+  /opt/trex/scripts/train_origami_docker_vlm_action_lora.sh \
+    --dataset-root /mnt/data/Robotic_Origami_Challenge \
+    --model-path /mnt/checkpoints/Qwen3-VL-2B-Instruct \
+    --resume-checkpoint /mnt/checkpoints/T-Rex-origami-posttrain/checkpoint-0-50000 \
+    --gpus 0
+```
 
 ## Preflight without starting training
 

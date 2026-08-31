@@ -41,6 +41,7 @@ from transformers.cache_utils import DynamicCache
 from .modeling_qwen3vl_mot import Qwen3VLModelMoT
 from .diffusion import ActionEmbedder, TimestepEmbedder, FinalLayer
 from .DeformAE import DeformEncoder
+from .m3_masking import make_m3_attention_mask, rescale_visible_queries
 
 
 # ── Default image-pad token id (matches Qwen3-VL / Qwen2-VL) ────────────────
@@ -541,6 +542,93 @@ class Qwen3VLVLAModel(nn.Module):
                     "tactile_flow_continue.")
         return new_cache
 
+    @staticmethod
+    def _m3_action_attention_mask(
+        *,
+        latent_visibility: Optional[torch.Tensor],
+        fast_visibility: Optional[torch.Tensor],
+        n_state: int,
+        action_query_visibility: Optional[torch.Tensor],
+        query_start: int,
+        query_len: int,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Build an M3 mask for an action-expert forward.
+
+        The action sequence is laid out as ``[fast, state, time, queries]``;
+        ``latent_visibility`` describes the cached/current slow prefix.
+        ``None`` keeps the pre-M3 path byte-for-byte compatible.
+        """
+        if latent_visibility is None or action_query_visibility is None:
+            return None
+        batch_size = latent_visibility.shape[0]
+        device = latent_visibility.device
+        if fast_visibility is None:
+            fast_visibility = torch.empty(
+                (batch_size, 0), dtype=torch.bool, device=device
+            )
+        always_visible = torch.ones(
+            (batch_size, int(n_state) + 1),
+            dtype=torch.bool,
+            device=device,
+        )  # optional state + flow-time token
+        full_visibility = torch.cat(
+            [latent_visibility, fast_visibility, always_visible,
+             action_query_visibility],
+            dim=1,
+        )
+        return make_m3_attention_mask(
+            full_visibility,
+            query_start=query_start,
+            query_len=query_len,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _m3_tactile_attention_mask(
+        *,
+        prefix_visibility: Optional[torch.Tensor],
+        tactile_keep: Optional[torch.Tensor],
+        n_tactile_observations: int,
+        action_query_visibility: Optional[torch.Tensor],
+        query_start: int,
+        query_len: int,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Build an M3 mask for a tactile-expert KV-cache append."""
+        if prefix_visibility is None or action_query_visibility is None:
+            return None
+        batch_size = prefix_visibility.shape[0]
+        device = prefix_visibility.device
+        n_obs = int(n_tactile_observations)
+        if tactile_keep is None:
+            tactile_visibility = torch.ones(
+                (batch_size, n_obs), dtype=torch.bool, device=device
+            )
+        else:
+            tactile_visibility = tactile_keep.to(device=device, dtype=torch.bool)
+            if tactile_visibility.shape != (batch_size,):
+                raise ValueError(
+                    "tactile_keep must be [B], got "
+                    f"{tuple(tactile_visibility.shape)}"
+                )
+            tactile_visibility = tactile_visibility[:, None].expand(batch_size, n_obs)
+        tau_visibility = torch.ones(
+            (batch_size, 1), dtype=torch.bool, device=device
+        )
+        current_visibility = torch.cat(
+            [tactile_visibility, tau_visibility, action_query_visibility], dim=1
+        )
+        full_visibility = torch.cat(
+            [prefix_visibility, current_visibility], dim=1
+        )
+        return make_m3_attention_mask(
+            full_visibility,
+            query_start=query_start,
+            query_len=query_len,
+            dtype=dtype,
+        )
+
     # ──────────────────────────────────────────────────────────────────────
     # Cascaded flow matching
     #
@@ -651,6 +739,10 @@ class Qwen3VLVLAModel(nn.Module):
         num_steps_total: int = 10,
         split_step: int = 6,
         refresh_clean_kv: bool = True,
+        m3_latent_visibility: Optional[torch.Tensor] = None,
+        m3_fast_visibility: Optional[torch.Tensor] = None,
+        m3_action_query_visibility: Optional[torch.Tensor] = None,
+        m3_query_mask_prob: float = 0.0,
     ) -> Tuple[torch.Tensor, "DynamicCache", int, float]:
         """Cascaded slow-tick: run the action expert for `split_step` of
         `num_steps_total` Euler steps, stopping at τ = 1 − split_step/num_steps_total.
@@ -691,6 +783,12 @@ class Qwen3VLVLAModel(nn.Module):
         for i in range(split_step):
             timesteps = self.t_embedder(time.expand(B)).unsqueeze(1)
             noisy_act = self.x_embedder(x_t)
+            if m3_action_query_visibility is not None:
+                noisy_act = rescale_visible_queries(
+                    noisy_act,
+                    m3_action_query_visibility,
+                    m3_query_mask_prob,
+                )
             act_parts = [fast_embeds]
             if n_state > 0:
                 act_parts.append(state_embeds)
@@ -698,12 +796,32 @@ class Qwen3VLVLAModel(nn.Module):
             act_seq = torch.cat(act_parts, dim=1)
             n_act = act_seq.shape[1]
 
-            if past_kv is None:
+            first_action_forward = past_kv is None
+            if not first_action_forward:
+                past_kv.crop(-n_act)
+
+            m3_attention_mask = self._m3_action_attention_mask(
+                latent_visibility=m3_latent_visibility,
+                fast_visibility=m3_fast_visibility,
+                n_state=n_state,
+                action_query_visibility=m3_action_query_visibility,
+                query_start=(
+                    0 if first_action_forward else past_kv.get_seq_length()
+                ),
+                query_len=(L_latent + n_act if first_action_forward else n_act),
+                dtype=act_seq.dtype,
+            )
+
+            if first_action_forward:
                 full_embeds = torch.cat([inputs_embeds, act_seq], dim=1)
                 outputs = self.model(
                     inputs_embeds=full_embeds,
                     position_ids=position_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=(
+                        m3_attention_mask
+                        if m3_attention_mask is not None
+                        else attention_mask
+                    ),
                     past_key_values=past_kv,
                     use_cache=True,
                     latent_indexes=torch.arange(0, L_latent, device=device),
@@ -711,12 +829,12 @@ class Qwen3VLVLAModel(nn.Module):
                     tactile_indexes=torch.arange(0, 0, device=device),
                 )
             else:
-                past_kv.crop(-n_act)
                 extended_pos = self.model._extend_position_ids(position_ids, n_act, 0)
                 act_pos = extended_pos[..., -n_act:]
                 outputs = self.model(
                     inputs_embeds=act_seq,
                     position_ids=act_pos,
+                    attention_mask=m3_attention_mask,
                     past_key_values=past_kv,
                     use_cache=True,
                     latent_indexes=torch.arange(0, 0, device=device),
@@ -738,6 +856,12 @@ class Qwen3VLVLAModel(nn.Module):
                 time.expand(B)
             ).unsqueeze(1)
             split_actions = self.x_embedder(x_t)
+            if m3_action_query_visibility is not None:
+                split_actions = rescale_visible_queries(
+                    split_actions,
+                    m3_action_query_visibility,
+                    m3_query_mask_prob,
+                )
             clean_parts = [fast_embeds]
             if n_state > 0:
                 clean_parts.append(state_embeds)
@@ -746,9 +870,19 @@ class Qwen3VLVLAModel(nn.Module):
             n_act_final = clean_seq.shape[1]
             extended_pos = self.model._extend_position_ids(position_ids, n_act_final, 0)
             act_pos_final = extended_pos[..., -n_act_final:]
+            m3_attention_mask = self._m3_action_attention_mask(
+                latent_visibility=m3_latent_visibility,
+                fast_visibility=m3_fast_visibility,
+                n_state=n_state,
+                action_query_visibility=m3_action_query_visibility,
+                query_start=past_kv.get_seq_length(),
+                query_len=n_act_final,
+                dtype=clean_seq.dtype,
+            )
             _ = self.model(
                 inputs_embeds=clean_seq,
                 position_ids=act_pos_final,
+                attention_mask=m3_attention_mask,
                 past_key_values=past_kv,
                 use_cache=True,
                 latent_indexes=torch.arange(0, 0, device=device),
@@ -843,6 +977,10 @@ class Qwen3VLVLAModel(nn.Module):
         tactile_deform: Optional[torch.Tensor] = None,
         tactile_codes: Optional[torch.Tensor] = None,
         tactile_f6_history: Optional[torch.Tensor] = None,
+        m3_prefix_visibility: Optional[torch.Tensor] = None,
+        m3_tactile_keep: Optional[torch.Tensor] = None,
+        m3_action_query_visibility: Optional[torch.Tensor] = None,
+        m3_query_mask_prob: float = 0.0,
     ) -> torch.Tensor:
         """Single tactile-only forward at (x_τ, τ) for cascaded training.
 
@@ -864,6 +1002,12 @@ class Qwen3VLVLAModel(nn.Module):
 
         tau_emb = self.t_embedder(tau.to(dtype)).unsqueeze(1)            # [B, 1, H]
         x_emb   = self.x_embedder(x_tau.to(dtype))                       # [B, n_chunk, H]
+        if m3_action_query_visibility is not None:
+            x_emb = rescale_visible_queries(
+                x_emb,
+                m3_action_query_visibility,
+                m3_query_mask_prob,
+            )
         full_embeds = torch.cat([tac_obs, tau_emb, x_emb], dim=1)
         n_tac_seq = full_embeds.shape[1]
 
@@ -871,9 +1015,20 @@ class Qwen3VLVLAModel(nn.Module):
             latent_position_ids, n_action_in_cache, n_tac_seq)
         tac_pos = extended_pos[..., -n_tac_seq:]
 
+        m3_attention_mask = self._m3_tactile_attention_mask(
+            prefix_visibility=m3_prefix_visibility,
+            tactile_keep=m3_tactile_keep,
+            n_tactile_observations=n_obs,
+            action_query_visibility=m3_action_query_visibility,
+            query_start=cached_kv.get_seq_length(),
+            query_len=n_tac_seq,
+            dtype=full_embeds.dtype,
+        )
+
         outputs = self.model(
             inputs_embeds=full_embeds,
             position_ids=tac_pos,
+            attention_mask=m3_attention_mask,
             past_key_values=cached_kv,
             use_cache=True,
             latent_indexes=torch.arange(0, 0, device=device),

@@ -21,7 +21,7 @@ Nothing is mounted at evaluation time.
 Run from the `T-Rex` directory or use the absolute script path:
 
 ```bash
-./docker/build_office.sh fold-the-world/origami-policy:submission
+../submission/build_office.sh fold-the-world/origami-policy:submission
 ```
 
 Export the built office image as the submission archive. The default output
@@ -29,13 +29,14 @@ name follows the complete participant guide and includes the `-submission`
 suffix:
 
 ```bash
-./docker/package_office.sh \
-  fold-the-world/origami-policy:submission \
-  fold-the-world-origami-policy-submission.tar.zst
+../submission/package_office.sh \
+  fold-the-world/origami-policy:submission
 ```
 
 The script runs `docker save`, tests the compressed archive, and writes the
-matching `.sha256` checksum file.
+matching `.sha256` checksum file. Each run creates a timestamped directory under
+the repository's `submissions/` directory and also writes the generated submission
+Markdown and `submission-manifest.json` there.
 
 The build script uses BuildKit named contexts so the large base model and
 checkpoint are copied into the image without making the whole workspace the

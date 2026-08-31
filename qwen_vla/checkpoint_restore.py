@@ -1,9 +1,9 @@
 """Checkpoint restoration helpers shared by T-Rex deployment entry points.
 
-Post-training can change the action/state dimensions and wrap the action
-expert's Linear layers with LoRA.  Those changes must be reconstructed before
-``load_state_dict``; otherwise ``strict=False`` silently leaves a large part of
-the action expert randomly initialized.
+Post-training can change the action/state dimensions and wrap the latent VLM
+and action expert Linear layers with LoRA.  Those changes must be reconstructed
+before ``load_state_dict``; otherwise ``strict=False`` silently leaves a large
+part of the model randomly initialized.
 """
 
 from __future__ import annotations
@@ -27,6 +27,16 @@ ACTION_LORA_TARGET_SUFFIXES = (
     "mlp_action.gate_proj",
     "mlp_action.up_proj",
     "mlp_action.down_proj",
+)
+
+VLM_LORA_TARGET_SUFFIXES = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
 )
 
 
@@ -75,6 +85,26 @@ def inject_action_expert_lora(
     return len(replacements)
 
 
+def inject_vlm_lora(
+    model: nn.Module, *, rank: int, alpha: float, dropout: float = 0.0
+) -> int:
+    """Wrap latent/text VLM projections using the training-time module layout."""
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and name.endswith(VLM_LORA_TARGET_SUFFIXES):
+            parent_name, child_name = name.rsplit(".", 1)
+            replacements.append((parent_name, child_name, module))
+
+    module_lookup = dict(model.named_modules())
+    for parent_name, child_name, module in replacements:
+        setattr(
+            module_lookup[parent_name],
+            child_name,
+            ActionLoRALinear(module, rank, alpha, dropout),
+        )
+    return len(replacements)
+
+
 def load_checkpoint_state(path: str | Path) -> dict[str, torch.Tensor]:
     """Load a plain model state dict while using the safe torch loader when possible."""
     try:
@@ -88,18 +118,42 @@ def load_checkpoint_state(path: str | Path) -> dict[str, torch.Tensor]:
     return dict(state)
 
 
-def infer_action_lora_rank(state_dict: Mapping[str, torch.Tensor]) -> int | None:
-    """Return the single LoRA rank encoded by checkpoint tensors, if present."""
+def _infer_lora_rank(
+    state_dict: Mapping[str, torch.Tensor],
+    target_suffixes: tuple[str, ...],
+    label: str,
+) -> int | None:
     ranks = {
         int(value.shape[0])
         for key, value in state_dict.items()
-        if key.endswith(".lora_A") and value.ndim == 2
+        if key.endswith(".lora_A")
+        and value.ndim == 2
+        and key[: -len(".lora_A")].endswith(target_suffixes)
     }
     if not ranks:
         return None
     if len(ranks) != 1:
-        raise ValueError(f"Checkpoint contains inconsistent action LoRA ranks: {sorted(ranks)}")
+        raise ValueError(
+            f"Checkpoint contains inconsistent {label} LoRA ranks: {sorted(ranks)}"
+        )
     return ranks.pop()
+
+
+def infer_action_lora_rank(state_dict: Mapping[str, torch.Tensor]) -> int | None:
+    """Return the action-expert LoRA rank encoded by checkpoint tensors, if present."""
+    return _infer_lora_rank(state_dict, ACTION_LORA_TARGET_SUFFIXES, "action")
+
+
+def infer_vlm_lora_rank(state_dict: Mapping[str, torch.Tensor]) -> int | None:
+    """Return the latent/text VLM LoRA rank encoded by checkpoint tensors, if present."""
+    return _infer_lora_rank(state_dict, VLM_LORA_TARGET_SUFFIXES, "VLM")
+
+
+def _resolve_lora_alpha(*, alpha: float | None, saved_alpha: Any, rank: int) -> float:
+    """Resolve alpha while preserving the historical 2*rank fallback."""
+    return float(
+        alpha if alpha is not None else saved_alpha if saved_alpha is not None else 2 * rank
+    )
 
 
 def restore_action_lora(
@@ -130,16 +184,61 @@ def restore_action_lora(
             f"checkpoint tensors encode {checkpoint_rank}"
         )
     saved_alpha = training_args.get("action_lora_alpha")
-    resolved_alpha = float(
-        alpha if alpha is not None else saved_alpha if saved_alpha is not None else 2 * resolved_rank
+    resolved_alpha = _resolve_lora_alpha(
+        alpha=alpha, saved_alpha=saved_alpha, rank=resolved_rank
     )
     count = inject_action_expert_lora(
         model, rank=resolved_rank, alpha=resolved_alpha, dropout=0.0
     )
-    expected = sum(key.endswith(".lora_A") for key in state_dict)
+    expected = sum(
+        key.endswith(".lora_A")
+        and key[: -len(".lora_A")].endswith(ACTION_LORA_TARGET_SUFFIXES)
+        for key in state_dict
+    )
     if count != expected:
         raise RuntimeError(
             f"Reconstructed {count} action LoRA modules, but checkpoint contains "
+            f"{expected} lora_A tensors"
+        )
+    return count, resolved_rank, resolved_alpha
+
+
+def restore_vlm_lora(
+    model: nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    training_args: Mapping[str, Any],
+    rank: int | None = None,
+    alpha: float | None = None,
+) -> tuple[int, int, float] | None:
+    """Rebuild latent/text VLM LoRA before loading a checkpoint."""
+    checkpoint_rank = infer_vlm_lora_rank(state_dict)
+    if checkpoint_rank is None:
+        return None
+
+    saved_rank = training_args.get("vlm_lora_rank")
+    resolved_rank = int(rank or saved_rank or checkpoint_rank)
+    if resolved_rank != checkpoint_rank:
+        raise ValueError(
+            f"VLM LoRA rank mismatch: requested {resolved_rank}, "
+            f"checkpoint tensors encode {checkpoint_rank}"
+        )
+    resolved_alpha = _resolve_lora_alpha(
+        alpha=alpha,
+        saved_alpha=training_args.get("vlm_lora_alpha"),
+        rank=resolved_rank,
+    )
+    count = inject_vlm_lora(
+        model, rank=resolved_rank, alpha=resolved_alpha, dropout=0.0
+    )
+    expected = sum(
+        key.endswith(".lora_A")
+        and key[: -len(".lora_A")].endswith(VLM_LORA_TARGET_SUFFIXES)
+        for key in state_dict
+    )
+    if count != expected:
+        raise RuntimeError(
+            f"Reconstructed {count} VLM LoRA modules, but checkpoint contains "
             f"{expected} lora_A tensors"
         )
     return count, resolved_rank, resolved_alpha

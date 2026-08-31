@@ -41,6 +41,7 @@ from qwen_vla.checkpoint_restore import (
     load_checkpoint_state,
     load_inference_statistics,
     restore_action_lora,
+    restore_vlm_lora,
 )
 
 
@@ -267,6 +268,25 @@ def model_load(args):
             vqvae_codebook_size=getattr(args, "vqvae_codebook_size", 64),
             use_tactile_vqvae=bool(getattr(args, "use_tactile_vqvae", 0)),
             vqvae_config=getattr(args, "vqvae_config", None),
+        )
+
+    vlm_lora = restore_vlm_lora(
+        model,
+        sd,
+        training_args=ta,
+        rank=getattr(args, "vlm_lora_rank", None),
+        alpha=getattr(args, "vlm_lora_alpha", None),
+    )
+    if vlm_lora is not None:
+        count, rank, alpha = vlm_lora
+        if "vlm_lora_alpha" not in ta and getattr(args, "vlm_lora_alpha", None) is None:
+            print(
+                "WARNING: checkpoint predates persisted VLM-LoRA metadata; "
+                f"using historical alpha=2*rank={alpha:g}."
+            )
+        print(
+            f"Reconstructed latent VLM LoRA: modules={count}, "
+            f"rank={rank}, alpha={alpha:g}, dropout=0 (inference)"
         )
 
     lora = restore_action_lora(
@@ -895,6 +915,10 @@ def build_arg_parser(
     parser.add_argument("--action_lora_rank", type=int, default=None,
                         help="default: infer from checkpoint lora_A tensors")
     parser.add_argument("--action_lora_alpha", type=float, default=None,
+                        help="default: training metadata, or historical 2*rank")
+    parser.add_argument("--vlm_lora_rank", type=int, default=None,
+                        help="default: restore from training_args.json or infer from checkpoint")
+    parser.add_argument("--vlm_lora_alpha", type=float, default=None,
                         help="default: training metadata, or historical 2*rank")
     parser.add_argument("--allow_non_strict_checkpoint", action="store_true",
                         help="diagnostic escape hatch; strict loading is the default")

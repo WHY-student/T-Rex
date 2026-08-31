@@ -47,6 +47,11 @@ NUM_PROCESSES=$((NUM_MACHINES * 8))
 
 TRAIN_BSZ=16
 LR=1e-4
+M3_ENABLE=${M3_ENABLE:-0}
+M3_VISION_MASK_PROB=${M3_VISION_MASK_PROB:-0.5}
+M3_LANGUAGE_MASK_PROB=${M3_LANGUAGE_MASK_PROB:-0.1}
+M3_QUERY_MASK_PROB=${M3_QUERY_MASK_PROB:-0.1}
+M3_TACTILE_MASK_PROB=${M3_TACTILE_MASK_PROB:-0.1}
 
 accelerate launch \
     --config_file ../config/sft_qwen.yaml \
@@ -85,6 +90,11 @@ accelerate launch \
     --cascaded_split_step 6 \
     --cascaded_tactile_dropout 0.1 \
     --cascaded_loss_weight 1.0 \
+    --m3_enable ${M3_ENABLE} \
+    --m3_vision_mask_prob ${M3_VISION_MASK_PROB} \
+    --m3_language_mask_prob ${M3_LANGUAGE_MASK_PROB} \
+    --m3_query_mask_prob ${M3_QUERY_MASK_PROB} \
+    --m3_tactile_mask_prob ${M3_TACTILE_MASK_PROB} \
     --resume_checkpoint ${RESUME_CHECKPOINT} \
     --resume_source ${RESUME_SOURCE} \
     --use_flare 1 \

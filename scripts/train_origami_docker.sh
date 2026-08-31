@@ -10,16 +10,16 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DATASET_ROOT="${TREX_DATASET_ROOT:-}"
 MODEL_PATH="${TREX_MODEL_PATH:-/mnt/models/Qwen3-VL-2B-Instruct}"
-RESUME_CHECKPOINT="${TREX_RESUME_CHECKPOINT:-/mnt/checkpoints/T-Rex-midTrain}"
+RESUME_CHECKPOINT="${TREX_RESUME_CHECKPOINT:-/mnt/checkpoints/T-Rex-origami-posttrain/checkpoint-0-50000}"
 DEFORM_ENCODER_PATH="${TREX_DEFORM_ENCODER_PATH:-}"
 VQVAE_CKPT="${TREX_VQVAE_CKPT:-}"
-OUTPUT_ROOT="${TREX_CHECKPOINT_DIR:-/mnt/checkpoints/T-Rex-origami-posttrain}"
+OUTPUT_ROOT="${TREX_CHECKPOINT_DIR:-/mnt/checkpoints/T-Rex-origami-posttrain-m3-vlm-lora}"
 LOG_ROOT="${TREX_LOG_DIR:-${OUTPUT_ROOT}/logs}"
 LOG_ROOT_SET=0
 [[ -n "${TREX_LOG_DIR:-}" ]] && LOG_ROOT_SET=1
 GPU_IDS="${TREX_GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0}}"
 BATCH_SIZE="${TREX_BATCH_SIZE:-16}"
-STEPS="${TREX_STEPS:-0}"
+STEPS="${TREX_STEPS:-10000}"
 EPOCHS="${TREX_EPOCHS:-3}"
 EPOCHS_SET=0
 [[ -n "${TREX_EPOCHS:-}" ]] && EPOCHS_SET=1
@@ -36,8 +36,17 @@ ACTION_LORA="${TREX_ACTION_LORA:-1}"
 ACTION_LORA_RANK="${TREX_ACTION_LORA_RANK:-16}"
 ACTION_LORA_ALPHA="${TREX_ACTION_LORA_ALPHA:-32}"
 ACTION_LORA_DROPOUT="${TREX_ACTION_LORA_DROPOUT:-0.05}"
+VLM_LORA="${TREX_VLM_LORA:-1}"
+VLM_LORA_RANK="${TREX_VLM_LORA_RANK:-16}"
+VLM_LORA_ALPHA="${TREX_VLM_LORA_ALPHA:-32}"
+VLM_LORA_DROPOUT="${TREX_VLM_LORA_DROPOUT:-0.05}"
+M3_ENABLE="${TREX_M3_ENABLE:-1}"
+M3_VISION_MASK_PROB="${TREX_M3_VISION_MASK_PROB:-0.5}"
+M3_LANGUAGE_MASK_PROB="${TREX_M3_LANGUAGE_MASK_PROB:-0.1}"
+M3_QUERY_MASK_PROB="${TREX_M3_QUERY_MASK_PROB:-0.1}"
+M3_TACTILE_MASK_PROB="${TREX_M3_TACTILE_MASK_PROB:-0.1}"
 OFFLOAD_OPTIMIZER_DEVICE="${TREX_OFFLOAD_OPTIMIZER_DEVICE:-}"
-EXPERIMENT_NAME="${TREX_EXPERIMENT_NAME:-t-rex_origami_65d_freeze_vlm}"
+EXPERIMENT_NAME="${TREX_EXPERIMENT_NAME:-t-rex_origami_65d_vlm_action_lora}"
 RUN_NAME="${TREX_RUN_NAME:-}"
 RESUME_GLOBAL_STEP="${TREX_RESUME_GLOBAL_STEP:-0}"
 SKIP_PREFLIGHT=0
@@ -54,16 +63,23 @@ Required:
 
 Common options:
   --model-path PATH         Local Qwen3-VL-2B-Instruct directory
-  --resume-checkpoint PATH  T-Rex mid-train directory or model.pt
+  --resume-checkpoint PATH  T-Rex checkpoint directory or model.pt
   --deform-encoder PATH     Defaults to RESUME_CHECKPOINT/deform_encoder_from_model_pt.pth
   --checkpoint-dir PATH     Base output directory for checkpoints
   --gpus IDS                all or a list visible inside the process, e.g. 0,1
   --batch-size N             Per-GPU micro-batch size
-  --steps N                  Optimizer steps; default 0 (epoch-based training)
+  --steps N                  Optimizer steps; default 10000
   --epochs N                 Epoch limit when --steps 0; default 3
   --save-steps N             Checkpoint interval
   --grad-accum N             Gradient accumulation steps
-  --full-vlm                 Train the VLM instead of freeze+Action-LoRA
+  --freeze-vlm N             1 freezes the VLM base; VLM-LoRA implies 1
+  --full-vlm                 Train the full VLM (disables both LoRA modes)
+  --vlm-lora N               1 trains latent/text VLM LoRA adapters (default: 1)
+  --vlm-lora-rank N          VLM-LoRA rank (default: 16)
+  --vlm-lora-alpha A         VLM-LoRA alpha (default: 32)
+  --vlm-lora-dropout P       VLM-LoRA dropout (default: 0.05)
+  M3 masking: set TREX_M3_ENABLE=1; probabilities use
+  TREX_M3_{VISION,LANGUAGE,QUERY,TACTILE}_MASK_PROB (defaults 0.5/0.1/0.1/0.1)
   --skip-preflight           Skip dataset/video preflight checks
   --dry-run                  Print the final Accelerate command and exit
 USAGE
@@ -100,11 +116,15 @@ while [[ $# -gt 0 ]]; do
         --val-freq) need_value "$1" "$2"; VAL_FREQ="$2"; shift 2 ;;
         --max-val-batches) need_value "$1" "$2"; MAX_VAL_BATCHES="$2"; shift 2 ;;
         --freeze-vlm) need_value "$1" "$2"; FREEZE_VLM="$2"; shift 2 ;;
-        --full-vlm) FREEZE_VLM=0; ACTION_LORA=0; shift ;;
+        --full-vlm) FREEZE_VLM=0; ACTION_LORA=0; VLM_LORA=0; shift ;;
         --action-lora) need_value "$1" "$2"; ACTION_LORA="$2"; shift 2 ;;
         --action-lora-rank) need_value "$1" "$2"; ACTION_LORA_RANK="$2"; shift 2 ;;
         --action-lora-alpha) need_value "$1" "$2"; ACTION_LORA_ALPHA="$2"; shift 2 ;;
         --action-lora-dropout) need_value "$1" "$2"; ACTION_LORA_DROPOUT="$2"; shift 2 ;;
+        --vlm-lora) need_value "$1" "$2"; VLM_LORA="$2"; shift 2 ;;
+        --vlm-lora-rank) need_value "$1" "$2"; VLM_LORA_RANK="$2"; shift 2 ;;
+        --vlm-lora-alpha) need_value "$1" "$2"; VLM_LORA_ALPHA="$2"; shift 2 ;;
+        --vlm-lora-dropout) need_value "$1" "$2"; VLM_LORA_DROPOUT="$2"; shift 2 ;;
         --offload-optimizer-device) need_value "$1" "$2"; OFFLOAD_OPTIMIZER_DEVICE="$2"; shift 2 ;;
         --experiment-name) need_value "$1" "$2"; EXPERIMENT_NAME="$2"; shift 2 ;;
         --run-name) need_value "$1" "$2"; RUN_NAME="$2"; shift 2 ;;
@@ -122,7 +142,7 @@ if (( LOG_ROOT_SET == 0 )); then
 fi
 
 is_integer() { [[ "$1" =~ ^[0-9]+$ ]]; }
-for value_name in BATCH_SIZE STEPS EPOCHS SAVE_STEPS MAX_CKPTS GRAD_ACCUM NUM_WORKERS VAL_NUM_WORKERS VAL_FREQ MAX_VAL_BATCHES RESUME_GLOBAL_STEP; do
+for value_name in BATCH_SIZE STEPS EPOCHS SAVE_STEPS MAX_CKPTS GRAD_ACCUM NUM_WORKERS VAL_NUM_WORKERS VAL_FREQ MAX_VAL_BATCHES RESUME_GLOBAL_STEP ACTION_LORA_RANK VLM_LORA_RANK; do
     value="${!value_name}"
     is_integer "$value" || die "$value_name must be a non-negative integer, got '$value'"
 done
@@ -145,6 +165,12 @@ fi
 # value terminate the loop before max_steps is reached.
 if (( STEPS > 0 && EPOCHS_SET == 0 )); then
     EPOCHS=1000000
+fi
+TARGET_MAX_STEPS=0
+if (( STEPS > 0 )); then
+    # The Docker interface expresses the requested number of *new* steps.
+    # train_origami_freeze_vlm.py uses an absolute global-step stop position.
+    TARGET_MAX_STEPS=$((STEPS + RESUME_GLOBAL_STEP))
 fi
 
 if [[ -n "${CONDA_DEFAULT_ENV:-}" && "${CONDA_DEFAULT_ENV}" == "trex" ]]; then
@@ -203,6 +229,11 @@ if [[ -n "$RESUME_CHECKPOINT" ]]; then
 fi
 [[ "$FREEZE_VLM" == "0" || "$FREEZE_VLM" == "1" ]] || die "--freeze-vlm must be 0 or 1"
 [[ "$ACTION_LORA" == "0" || "$ACTION_LORA" == "1" ]] || die "--action-lora must be 0 or 1"
+[[ "$VLM_LORA" == "0" || "$VLM_LORA" == "1" ]] || die "--vlm-lora must be 0 or 1"
+if [[ "$VLM_LORA" == "1" ]]; then
+    # VLM-LoRA always means frozen VLM base + trainable adapter parameters.
+    FREEZE_VLM=1
+fi
 if [[ -n "$DEFORM_ENCODER_PATH" && ! -f "$DEFORM_ENCODER_PATH" ]]; then
     die "deform encoder checkpoint does not exist: $DEFORM_ENCODER_PATH"
 fi
@@ -221,7 +252,7 @@ TRAIN_ARGS=(
     --lerobot_root "$DATASET_ROOT"
     --lerobot_repo_id origami/local
     --n_epochs "$EPOCHS"
-    --max_steps "$STEPS"
+    --max_steps "$TARGET_MAX_STEPS"
     --save_freq 1
     --save_steps "$SAVE_STEPS"
     --max_ckpts "$MAX_CKPTS"
@@ -243,6 +274,10 @@ TRAIN_ARGS=(
     --action_lora_rank "$ACTION_LORA_RANK"
     --action_lora_alpha "$ACTION_LORA_ALPHA"
     --action_lora_dropout "$ACTION_LORA_DROPOUT"
+    --vlm_lora "$VLM_LORA"
+    --vlm_lora_rank "$VLM_LORA_RANK"
+    --vlm_lora_alpha "$VLM_LORA_ALPHA"
+    --vlm_lora_dropout "$VLM_LORA_DROPOUT"
     --use_robot_state 1
     --use_tactile_vec 1
     --use_tactile_deform 1
@@ -254,6 +289,11 @@ TRAIN_ARGS=(
     --cascaded_split_step 6
     --cascaded_tactile_dropout 0.1
     --cascaded_loss_weight 1.0
+    --m3_enable "$M3_ENABLE"
+    --m3_vision_mask_prob "$M3_VISION_MASK_PROB"
+    --m3_language_mask_prob "$M3_LANGUAGE_MASK_PROB"
+    --m3_query_mask_prob "$M3_QUERY_MASK_PROB"
+    --m3_tactile_mask_prob "$M3_TACTILE_MASK_PROB"
     --resume_source midtrain
     --resume_global_step "$RESUME_GLOBAL_STEP"
     --use_flare 1
@@ -306,7 +346,9 @@ echo "  model:        $MODEL_PATH"
 echo "  resume:       ${RESUME_CHECKPOINT:-<none>}"
 echo "  GPUs:         $GPU_IDS ($GPU_COUNT process(es))"
 echo "  batch/GPU:    $BATCH_SIZE; grad_accum: $GRAD_ACCUM"
-echo "  steps/epochs: $STEPS / $EPOCHS"
+echo "  steps/epochs: $STEPS new (target global=$TARGET_MAX_STEPS) / $EPOCHS"
+echo "  adapters:     vlm_lora=$VLM_LORA (rank=$VLM_LORA_RANK); action_lora=$ACTION_LORA (rank=$ACTION_LORA_RANK); freeze_vlm=$FREEZE_VLM"
+echo "  M3 mask:      enable=$M3_ENABLE; vision=$M3_VISION_MASK_PROB; language=$M3_LANGUAGE_MASK_PROB; query=$M3_QUERY_MASK_PROB; tactile=$M3_TACTILE_MASK_PROB"
 echo "  checkpoints:  $OUTPUT_ROOT/$EXPERIMENT_NAME/$RUN_NAME"
 echo "  video:        pyav; episodes >260s are discarded by the loader"
 

@@ -67,16 +67,20 @@ RUN python -m pip install -e . --no-deps \
     && chmod +x \
         scripts/train_origami_docker.sh \
         scripts/train_origami_docker_freeze_lora.sh \
+        scripts/train_origami_docker_vlm_action_lora.sh \
         scripts/train_origami_docker_full_vlm.sh \
         scripts/check_trex_dataset.py
 
 # Keep the image build tied to the current Origami training path.
 RUN python -m py_compile \
         qwen_vla/origami_lerobot_dataset.py \
+        qwen_vla/m3_masking.py \
+        qwen_vla/checkpoint_restore.py \
         scripts/train_origami_freeze_vlm.py \
         scripts/check_trex_dataset.py
 
 ENV PYTHONPATH=/opt/trex:/opt/trex/third_party/lerobot/src \
+    LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
     HF_HOME=/mnt/cache/huggingface \
     TORCH_HOME=/mnt/cache/torch \
     TORCH_EXTENSIONS_DIR=/mnt/cache/torch_extensions
