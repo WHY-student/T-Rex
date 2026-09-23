@@ -85,7 +85,7 @@ inference:
   dual_arm: true
   # delta_eef62: original EEF-delta + IK path.
   # absolute_joint65: exact Origami joint targets, no EEF conversion/IK.
-  control_mode: delta_eef62
+  control_mode: absolute_joint65
   # In absolute_joint65 mode, fill these with the seven real SDK joints in
   # dataset motor_j0..motor_j6 order, e.g. "lower_body:lower_body_joint_1".
   # The client refuses to start while this mapping or the reset pose is empty.
@@ -98,6 +98,12 @@ inference:
   # Existing online Pinocchio collision checks cover only arm/hand 58D.
   # Enable only after reviewing body collisions on the real North robot.
   absolute_joint65_acknowledge_body_collision_unchecked: false
+  # Soft force safety for absolute_joint65. The threshold is 0.8 times the
+  # dataset-wide maximum of the ten fingertip fz values.
+  force_safety_enabled: true
+  force_safety_stats_path: ../../dataset/Robotic_Origami_Challenge/season_POC22061_2026_07_14_10_09_42_train/lerobot3.0/meta/stats.json
+  force_safety_threshold_ratio: 0.8
+  force_safety_dls_lambda: 0.0001
   chunk_size: 16
   execute_steps_per_chunk: 16
   max_steps: 10000

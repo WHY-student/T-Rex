@@ -159,6 +159,15 @@ class InferenceConfig:
     # 58 arm/hand joints and locks the body. Set this true only after a
     # separate body-collision review for the real North setup.
     absolute_joint65_acknowledge_body_collision_unchecked: bool = False
+    # Soft tactile-force post-processing for absolute_joint65. The threshold
+    # is threshold_ratio * max(observation.tactile[..., fz]) from the dataset.
+    force_safety_enabled: bool = True
+    force_safety_stats_path: str = (
+        "../../dataset/Robotic_Origami_Challenge/"
+        "season_POC22061_2026_07_14_10_09_42_train/lerobot3.0/meta/stats.json"
+    )
+    force_safety_threshold_ratio: float = 0.8
+    force_safety_dls_lambda: float = 1e-4
     # Action chunk length predicted by the policy.
     chunk_size: int = 16
     # Steps executed from each chunk before requesting a new one.

@@ -5,9 +5,7 @@ for the T-Rex checkpoint:
 
 ```text
 checkpoints/T-Rex-origami-posttrain/
-  t-rex_origami_65d_freeze_vlm/
-  t-rex_origami_65d_freeze_vlm_2x4090_3epoch_resume60000_0729_092738/
-  checkpoint-0-73000/
+  checkpoint-0-11407/
 ```
 
 The image uses the same Python 3.10 `trex` conda environment and pinned

@@ -26,6 +26,7 @@ import termios
 import threading
 import time
 import tty
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -47,6 +48,10 @@ from eval.absolute_joint65 import (
     BodyJointBinding,
     Joint65CommandRejected,
 )
+from eval.force_safety import (
+    AbsoluteJoint65ForceSafety,
+    AbsoluteJoint65NormalJacobianProvider,
+)
 
 # Wrist camera imports
 from camera.wrist_camera_receiver import WristCameraReceiver
@@ -58,7 +63,7 @@ from teleop.arm_hand_control import (
 )
 
 # IK and robot utilities
-from teleop.config import DEFAULT_CONFIG_PATH, TeleopConfig, load_config
+from teleop.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, TeleopConfig, load_config
 from teleop.ik_utils import PinkLocalIK
 from teleop.robot_descriptions import (
     DEXMATE_COMPONENT_NAME_TO_JOINT_NAMES,
@@ -73,6 +78,26 @@ TACTILE_BUFFER_SHAPES = {
     "deform": ((5, 240, 240), np.uint8),
 }
 HAND_JOINT_COUNT = 22
+
+
+def _resolve_force_safety_stats_path(value: "str | os.PathLike[str]") -> Path:
+    """Resolve a force-safety stats path from either the cwd or T-Rex root."""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+
+    candidates = (
+        Path.cwd() / path,
+        PROJECT_ROOT / path,
+        PROJECT_ROOT.parent / path,
+        PROJECT_ROOT.parent.parent / path,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    # Keep the T-Rex-root-relative interpretation in the error path so the
+    # startup exception tells the operator exactly where the config points.
+    return (PROJECT_ROOT / path).resolve()
 
 
 def aggregate_chunks(chunk_buffer, current_global_step, k):
@@ -690,6 +715,40 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
     )
     logger.info("SmoothingAndSafetyManager initialized")
 
+    force_safety_controller = None
+    force_jacobian_provider = None
+    if control_mode == "absolute_joint65" and inf.force_safety_enabled:
+        stats_path = _resolve_force_safety_stats_path(inf.force_safety_stats_path)
+        if not stats_path.is_file():
+            raise FileNotFoundError(
+                "Force-safety dataset statistics were not found: "
+                f"{stats_path} (configured as {inf.force_safety_stats_path!r})"
+            )
+        force_safety_controller = AbsoluteJoint65ForceSafety.from_stats_path(
+            stats_path,
+            threshold_ratio=inf.force_safety_threshold_ratio,
+            dls_lambda=inf.force_safety_dls_lambda,
+        )
+        force_jacobian_provider = AbsoluteJoint65NormalJacobianProvider(
+            robot_wrapper=pin_full_robot_wrapper,
+            assemble_qpos=assemble_qpos,
+        )
+        logger.info(
+            "absolute_joint65 force safety enabled: stats=%s, "
+            "dataset_max_fz=%.6f, threshold=%.6f (%.1f%%), "
+            "mode=block_downward_motion_only",
+            stats_path,
+            force_safety_controller.dataset_max_fz,
+            force_safety_controller.threshold_fz,
+            100.0 * force_safety_controller.threshold_ratio,
+        )
+    elif inf.force_safety_enabled:
+        logger.warning(
+            "inference.force_safety_enabled is set, but force post-processing "
+            "is only active in absolute_joint65 mode; current mode=%s",
+            control_mode,
+        )
+
     arm_hand_lower_limits = None
     arm_hand_upper_limits = None
     if control_mode == "absolute_joint65":
@@ -867,6 +926,19 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
     for ttype_lower, (shape, dtype) in TACTILE_BUFFER_SHAPES.items():
         left_tactile_buffers[ttype_lower] = np.zeros(shape, dtype=dtype)
         right_tactile_buffers[ttype_lower] = np.zeros(shape, dtype=dtype)
+
+    def latest_tactile_f6() -> np.ndarray:
+        """Return the newest ten-fingertip F6 snapshot in dataset order."""
+        with tactile_buf_lock:
+            if dual_arm:
+                return np.concatenate(
+                    [
+                        left_tactile_buffers["f6"],
+                        right_tactile_buffers["f6"],
+                    ],
+                    axis=0,
+                )
+            return right_tactile_buffers["f6"].copy()
 
     tactile_terminate_event = threading.Event()
     tactile_thread = threading.Thread(
@@ -1257,6 +1329,39 @@ def main(config: str = str(DEFAULT_CONFIG_PATH), task_description: Optional[str]
                         try:
                             with hardware_lock:
                                 current_joint65 = absolute_joint65_adapter.read_state()
+
+                            # Safety is applied to the selected action at every
+                            # command step.  This covers a newly generated or
+                            # tactile-refined chunk after it replaces/joins the
+                            # previous chunk; no old chunk is cancelled.
+                            if force_safety_controller is not None:
+                                assert force_jacobian_provider is not None
+                                safety_result = force_safety_controller.postprocess(
+                                    action=current_action,
+                                    current_joint65=current_joint65,
+                                    tactile_f6=latest_tactile_f6(),
+                                    normal_jacobians=force_jacobian_provider(
+                                        current_joint65
+                                    ),
+                                )
+                                current_action = safety_result.action_safe
+                                if safety_result.modified:
+                                    logger.debug(
+                                        "Force safety blocked downward motion: "
+                                        "max_fz=%.6f, threshold=%.6f, sides=%s, "
+                                        "dz_before=%s, dz_after=%s",
+                                        safety_result.measured_max_fz,
+                                        safety_result.threshold_fz,
+                                        safety_result.active_sides,
+                                        np.asarray(
+                                            safety_result.normal_displacement_before
+                                        )[0].tolist(),
+                                        np.asarray(
+                                            safety_result.normal_displacement_after
+                                        )[0].tolist(),
+                                    )
+
+                            with hardware_lock:
                                 joint65_parts, body_targets = (
                                     absolute_joint65_adapter.prepare(
                                         current_action, current_joint65
